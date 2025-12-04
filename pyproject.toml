@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=45", "wheel", "setuptools_scm[toml]>=6.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nanohub-citmanager"
+version = "0.1.0"
+description = "A Python library for interacting with HubZero Citation Manager API"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Daniel Mejia", email = "denphi@denphi.com"}
+]
+dependencies = [
+    "nanohubremote>=0.2.0",
+    "requests>=2.25.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=6.0",
+    "pytest-cov>=2.10",
+    "black>=21.0",
+]
+llm = [
+    "ollama>=0.1.0",
+    "openai>=1.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/denphi/nanohub-citmanager"
+Repository = "https://github.com/denphi/nanohub-citmanager"
