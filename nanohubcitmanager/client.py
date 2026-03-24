@@ -27,6 +27,8 @@ from .citation import Citation
 from .pdf import PDFManager
 from typing import List, Dict, Optional, Any
 import json
+import time
+import requests as _requests
 
 
 class CitationManagerClient:
@@ -76,27 +78,46 @@ class CitationManagerClient:
             Exception: If API returns an error
         """
         base = base_url if base_url else self.api_base
-        url = f"{base}/{endpoint}"
-        payload = {
-            "id": self._get_request_id(),
-            "params": params
-        }
+        url = f"{base}/{endpoint}".lstrip("/")
 
-        response = self.session.requestPost(url, json=payload)
-
-        payload_str = json.dumps(payload)
-        headers = self.session.headers
-        #print(f"curl -X POST {url} " + " ".join([f"-H '{k}: {v}'" for k, v in headers.items()]) + f" -H 'Content-Type: application/json' -d '{payload_str}'")
-
-        #print(response.text)
-        response.raise_for_status()
-
-        result = response.json()
-
-        if result.get("result", {}).get("status") == "ERROR":
-            raise Exception(f"API Error: {result['result'].get('message')}")
-
-        return result.get("result", {})
+        last_exc = None
+        for attempt in range(3):
+            payload = {
+                "id": self._get_request_id(),
+                "params": params
+            }
+            try:
+                full_url = self.session.getUrl(url)
+                # Use a bare requests.Session (no retry adapter) so 500s are
+                # returned as response objects instead of raising ResponseError.
+                # Auth headers are copied from the nanohubremote session.
+                with _requests.Session() as bare:
+                    bare.headers.update(self.session._session.headers)
+                    response = bare.post(full_url, json=payload, timeout=self.session.timeout)
+                print(f"    [api] POST {full_url} → status {response.status_code} body={response.text[:300]}")
+                if response.status_code >= 400:
+                    print(f"    [api] ERROR BODY: {response.text[:2000]}")
+                response.raise_for_status()
+                result = response.json()
+                if result.get("result", {}).get("status") == "ERROR":
+                    raise Exception(f"API Error: {result['result'].get('message')}")
+                return result.get("result", {})
+            except Exception as exc:
+                last_exc = exc
+                err_str = str(exc)
+                # Only retry on connection-level errors, not API-level errors
+                if "Max retries exceeded" in err_str or "Connection" in err_str or "ConnectionError" in err_str or "RemoteDisconnected" in err_str:
+                    print(f"    [api] attempt {attempt + 1}/3 connection error: {exc}")
+                    time.sleep(1 * (attempt + 1))
+                    # Try to reset the session's underlying connection pool
+                    try:
+                        if hasattr(self.session, '_session'):
+                            self.session._session.close()
+                    except Exception:
+                        pass
+                else:
+                    raise
+        raise last_exc
 
     def create(self, citation: Citation) -> int:
         """

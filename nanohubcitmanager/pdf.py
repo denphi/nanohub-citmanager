@@ -67,14 +67,12 @@ class PDFManager:
         }
 
         # Use the underlying session for streaming support
-        response = self.client.session._session.post(url, json=payload, stream=True)
-        response.raise_for_status()
-
-        # Write streamed content to file
-        with open(output_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
+        with self.client.session._session.post(url, json=payload, stream=True) as response:
+            response.raise_for_status()
+            with open(output_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
 
         return True
 

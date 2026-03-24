@@ -211,6 +211,8 @@ class Citation:
                 # Map all variations to camelCase expected by PersonExp::setByMap
                 # PersonExp expects: firstName, lastName, middleInitial (camelCase)
                 key_mapping = {
+                    'id': 'personId',          # GET returns 'id'; PHP saveAuthors checks 'personId'
+                    'personId': 'personId',    # Keep as-is
                     'firstname': 'firstName',  # Convert to camelCase
                     'firstName': 'firstName',  # Keep as-is
                     'middleinitial': 'middleInitial',
@@ -274,6 +276,19 @@ class Citation:
 
         return normalized
 
+    @staticmethod
+    def _to_latin1_safe(value: str) -> str:
+        """
+        Encode a string to latin-1 bytes and decode back.
+
+        The PHP backend calls mb_convert_encoding($value, 'UTF-8', 'ISO-8859-1')
+        on title and abstract, so it expects ISO-8859-1 (latin-1) encoded strings.
+        Characters outside the latin-1 range are replaced with '?'.
+        """
+        if not value:
+            return value
+        return value.encode('latin-1', errors='replace').decode('latin-1')
+
     def to_dict(self, include_none: bool = False) -> Dict[str, Any]:
         """
         Convert citation to dictionary for API requests.
@@ -285,8 +300,8 @@ class Citation:
             Dictionary representation of citation
         """
         data = {
-            'title': self.title,
-            'abstract': self.abstract,
+            'title': self._to_latin1_safe(self.title),
+            'abstract': self._to_latin1_safe(self.abstract),
             # Match DocumentExp::setByMap() field names exactly
             'publicationID': self.publication_id,  # Line 602: publicationID (not publicationId)
             'publicationName': self.publication_name,  # Handled by CitationCRUD before setByMap
