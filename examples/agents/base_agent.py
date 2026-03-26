@@ -11,6 +11,7 @@ Supports two LLM backends (auto-detected from environment variables):
 
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -94,6 +95,10 @@ def _to_openai_tools(anthropic_tools: List[Dict]) -> List[Dict]:
     return result
 
 
+_BAD_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
+
+
 # ---------------------------------------------------------------------------
 # Base agent
 # ---------------------------------------------------------------------------
@@ -123,6 +128,11 @@ class BaseCitationAgent:
     OPENAI_MODEL: str = ""  # falls back to LLM_MODEL env var
 
     MAX_ITERATIONS: int = 15
+    TOOL_RESULT_MAX_STRING_CHARS: int = 12000
+    TOOL_RESULT_MAX_JSON_CHARS: int = 45000
+    TOOL_RESULT_MAX_LIST_ITEMS: int = 200
+    TOOL_RESULT_MAX_DICT_ITEMS: int = 200
+    RETRY_COMPACT_KEEP_MESSAGES: int = 8
 
     def __init__(self, cit_client: CitationManagerClient):
         self.cit_client = cit_client
@@ -169,6 +179,74 @@ class BaseCitationAgent:
     # Agentic loop dispatcher
     # ------------------------------------------------------------------
 
+    def _sanitize_tool_value(self, value: Any) -> Any:
+        """Clean control chars and bound size of tool payloads sent back to LLM."""
+        if isinstance(value, str):
+            cleaned = _BAD_CONTROL_CHARS_RE.sub("", value)
+            cleaned = _SURROGATE_RE.sub("", cleaned)
+            # Ensure backend-safe UTF-8 payload
+            cleaned = cleaned.encode("utf-8", errors="replace").decode("utf-8")
+            if len(cleaned) > self.TOOL_RESULT_MAX_STRING_CHARS:
+                extra = len(cleaned) - self.TOOL_RESULT_MAX_STRING_CHARS
+                cleaned = (
+                    cleaned[: self.TOOL_RESULT_MAX_STRING_CHARS]
+                    + f"\n...[truncated {extra} chars]"
+                )
+            return cleaned
+        if isinstance(value, list):
+            items = value[: self.TOOL_RESULT_MAX_LIST_ITEMS]
+            return [self._sanitize_tool_value(v) for v in items]
+        if isinstance(value, dict):
+            out: Dict[str, Any] = {}
+            for i, (k, v) in enumerate(value.items()):
+                if i >= self.TOOL_RESULT_MAX_DICT_ITEMS:
+                    out["__truncated__"] = "Additional keys omitted for transport safety."
+                    break
+                out[str(k)] = self._sanitize_tool_value(v)
+            return out
+        return value
+
+    def _serialize_tool_outcome(self, outcome: Any) -> str:
+        """JSON-serialize tool result with sanitization and total-size clamp."""
+        safe = self._sanitize_tool_value(outcome)
+        content = json.dumps(safe, ensure_ascii=False, default=str)
+        if len(content) <= self.TOOL_RESULT_MAX_JSON_CHARS:
+            return content
+
+        # Final fallback: reduce to summary payload
+        preview = content[: self.TOOL_RESULT_MAX_JSON_CHARS]
+        fallback = {
+            "ok": bool((safe or {}).get("ok")) if isinstance(safe, dict) else True,
+            "note": "Tool output truncated before LLM handoff due size limits.",
+            "preview": preview,
+        }
+        return json.dumps(fallback, ensure_ascii=False, default=str)
+
+    def _compact_messages_for_retry(self, messages: List[Dict]) -> List[Dict]:
+        """
+        Keep system prompt + tail of conversation, with extra truncation on
+        large tool payloads. Used only as null-response recovery.
+        """
+        if not messages:
+            return messages
+
+        head = messages[:1]
+        tail = messages[1:]
+        if len(tail) > self.RETRY_COMPACT_KEEP_MESSAGES:
+            tail = tail[-self.RETRY_COMPACT_KEEP_MESSAGES :]
+
+        compacted: List[Dict] = []
+        for m in head + tail:
+            mm = dict(m)
+            content = mm.get("content")
+            if isinstance(content, str):
+                content = self._sanitize_tool_value(content)
+                if len(content) > 6000:
+                    content = content[:6000] + "\n...[compact-retry truncation]"
+                mm["content"] = content
+            compacted.append(mm)
+        return compacted
+
     def _run_agentic_loop(self, user_message: str) -> str:
         if self._backend == "anthropic":
             return self._run_anthropic_loop(user_message)
@@ -213,11 +291,12 @@ class BaseCitationAgent:
                         outcome = {"error": f"Missing required parameter: {exc}"}
                     except Exception as exc:
                         outcome = {"error": str(exc)}
-                    print(f"    ← {json.dumps(outcome)[:120]}")
+                    payload = self._serialize_tool_outcome(outcome)
+                    print(f"    ← {payload[:120]}")
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": tb.id,
-                        "content": json.dumps(outcome),
+                        "content": payload,
                     })
                 messages.append({"role": "user", "content": tool_results})
 
@@ -244,13 +323,30 @@ class BaseCitationAgent:
                         tools=tools,
                         tool_choice="auto",
                     )
-                    if response is not None:
+                    if response is not None and getattr(response, "choices", None):
                         break
+                    response = None
                     print(f"    [openai] null response, retrying (attempt {attempt + 1}/3)...")
                 except Exception as exc:
                     print(f"    [openai] request error: {exc}, retrying (attempt {attempt + 1}/3)...")
             if response is None:
-                return "Error: LLM returned no response after 3 attempts."
+                # Recovery path: compact context and try once more.
+                print("    [openai] retrying with compacted context...")
+                compacted = self._compact_messages_for_retry(messages)
+                try:
+                    response = self._llm_client.chat.completions.create(
+                        model=self._openai_model,
+                        messages=compacted,
+                        tools=tools,
+                        tool_choice="auto",
+                    )
+                    if response is not None and getattr(response, "choices", None):
+                        messages = compacted
+                except Exception as exc:
+                    print(f"    [openai] compact-retry error: {exc}")
+                    response = None
+            if response is None:
+                return "Error: LLM returned no response after retries (including compact-retry)."
 
             choice = response.choices[0]
             msg = choice.message
@@ -289,12 +385,13 @@ class BaseCitationAgent:
                         outcome = {"error": f"Missing required parameter: {exc}"}
                     except Exception as exc:
                         outcome = {"error": str(exc)}
-                    print(f"    ← {json.dumps(outcome)[:120]}")
+                    payload = self._serialize_tool_outcome(outcome)
+                    print(f"    ← {payload[:120]}")
 
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc.id,
-                        "content": json.dumps(outcome),
+                        "content": payload,
                     })
 
         return "Max iterations reached."

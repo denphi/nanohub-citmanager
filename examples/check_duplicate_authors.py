@@ -15,6 +15,8 @@ Requirements:
 import os
 import sys
 sys.path.insert(0, os.path.abspath('..'))
+from dotenv import load_dotenv
+load_dotenv()
 
 from nanohubremote import Session
 from nanohubcitmanager import CitationManagerClient, Citation

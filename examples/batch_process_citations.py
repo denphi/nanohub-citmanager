@@ -29,7 +29,8 @@ sys.path.insert(0, os.path.abspath('..'))
 
 from nanohubremote import Session
 from nanohubcitmanager import CitationManagerClient
-
+from dotenv import load_dotenv
+load_dotenv()
 
 def parse_args():
     """Parse command line arguments."""

@@ -153,6 +153,9 @@ def main():
     if args.id is not None and args.status is not None and not args.from_status:
         print("Error: --status is a batch filter and cannot be used with --id (use --from-status instead).")
         sys.exit(2)
+    if args.from_status is not None and args.id is None and args.status is None and args.year is None:
+        print("Error: --from-status in batch mode requires --status or --year to select citations.")
+        sys.exit(2)
 
     print("=" * 60)
     print("  CITATION PIPELINE RUNNER")
@@ -227,11 +230,19 @@ def main():
         cid = doc.get("id")
         print(f"\n[{i}/{len(docs)}] Processing citation {cid}...")
         try:
-            report = orchestrator.process_citation(
-                citation_id=cid,
-                run_full_pipeline=not args.single_stage,
-                stop_on_failure=True,
-            )
+            if args.from_status:
+                report = orchestrator.process_from_status(
+                    citation_id=cid,
+                    from_status=args.from_status,
+                    run_full_pipeline=not args.single_stage,
+                    stop_on_failure=True,
+                )
+            else:
+                report = orchestrator.process_citation(
+                    citation_id=cid,
+                    run_full_pipeline=not args.single_stage,
+                    stop_on_failure=True,
+                )
             if report.success:
                 success_count += 1
             else:

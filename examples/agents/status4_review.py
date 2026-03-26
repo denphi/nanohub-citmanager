@@ -14,6 +14,9 @@ the citation advances to status 5 for final human review.
 """
 
 import json
+import os
+import re
+import tempfile
 from typing import Any, Dict, List
 
 from .base_agent import BaseCitationAgent
@@ -31,6 +34,13 @@ class ReviewAgent(BaseCitationAgent):
     STAGE_NAME = "review"
     TARGET_STATUS = 4
     NEXT_STATUS = 5
+
+    @staticmethod
+    def _is_binary_flag(value: Any) -> bool:
+        try:
+            return int(value) in (0, 1)
+        except Exception:
+            return False
 
     # ------------------------------------------------------------------
     # System prompt
@@ -202,8 +212,12 @@ class ReviewAgent(BaseCitationAgent):
 
     def _build_prompt(self, citation) -> str:
         author_list = "\n".join(
-            f"    • {a.get('firstName','')} {a.get('lastName','')}".strip()
-            + (f" ({a.get('organization','')})" if a.get("organization") else "")
+            f"    • {a.get('firstname') or a.get('firstName') or ''} {a.get('lastname') or a.get('lastName') or ''}".strip()
+            + (
+                f" ({a.get('organization_name') or a.get('organizationname') or a.get('organization') or ''})"
+                if (a.get("organization_name") or a.get("organizationname") or a.get("organization"))
+                else ""
+            )
             for a in (citation.authors or [])
         ) or "    (no authors listed)"
 
@@ -218,4 +232,111 @@ class ReviewAgent(BaseCitationAgent):
             f"Authors  :\n{author_list}\n\n"
             "Assess whether any author is an experimentalist AND whether the paper reports "
             "experimental data, set both flags, then advance to status 5."
+        )
+
+    def _scan_pdf_nanohub_evidence(self, citation_id: int) -> Dict[str, Any]:
+        """Scan full PDF text for nanoHUB/NCN references."""
+        try:
+            from PyPDF2 import PdfReader
+        except Exception:
+            return {"found": False, "matches": [], "error": "PyPDF2 not available"}
+
+        fd, path = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
+        try:
+            self.cit_client.download_pdf(citation_id, path)
+            reader = PdfReader(path)
+            text = "\n".join((p.extract_text() or "") for p in reader.pages)
+            low = text.lower()
+            patterns = [
+                r"\bnanohub\b",
+                r"\bnano[-\s]?hub\b",
+                r"\bnanohub\.org\b",
+                r"\bncn\b",
+                r"\bnetwork for computational nanotechnology\b",
+            ]
+            matches = []
+            for p in patterns:
+                m = re.search(p, low)
+                if m:
+                    start = max(0, m.start() - 60)
+                    end = min(len(text), m.end() + 80)
+                    snippet = re.sub(r"\s+", " ", text[start:end]).strip()
+                    matches.append(snippet[:220])
+            # dedup
+            seen = set()
+            uniq = []
+            for s in matches:
+                k = s.lower()
+                if k in seen:
+                    continue
+                seen.add(k)
+                uniq.append(s)
+            return {"found": len(uniq) > 0, "matches": uniq[:5]}
+        except Exception as exc:
+            return {"found": False, "matches": [], "error": str(exc)}
+        finally:
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # Override run() — auto-advance fallback when both flags are set
+    # ------------------------------------------------------------------
+
+    def run(self, citation_id: int):
+        from .base_agent import AgentResult
+        citation = self.cit_client.get(citation_id)
+        status_before = citation.status
+
+        print(f"\n{'─'*60}")
+        print(f"  [{self.STAGE_NAME.upper()}] citation {citation_id}  (current status={status_before})")
+        print(f"{'─'*60}")
+
+        pdf_evidence = self._scan_pdf_nanohub_evidence(citation_id)
+        if pdf_evidence.get("found"):
+            # Keep an explicit audit note for downstream step 5.
+            existing = citation.notes or ""
+            evidence_line = " | ".join(pdf_evidence.get("matches", [])[:2])
+            tag = "[NANOHUB_EVIDENCE]"
+            if tag not in existing:
+                sep = "\n" if existing else ""
+                citation.notes = (
+                    f"{existing}{sep}[Agent/{self.STAGE_NAME}] {tag} "
+                    f"Full PDF text contains nanoHUB/NCN evidence: {evidence_line}"
+                )
+                self.cit_client.update(citation)
+                citation = self.cit_client.get(citation_id)
+
+        user_message = self._build_prompt(citation)
+        if pdf_evidence.get("found"):
+            snippets = "\n".join(f"  - {s}" for s in (pdf_evidence.get("matches") or [])[:3])
+            user_message += (
+                "\n\nnanoHUB/NCN evidence found in FULL PDF text (all pages):\n"
+                f"{snippets}\n"
+                "Use this evidence in your reasoning."
+            )
+        result_text = self._run_agentic_loop(user_message)
+
+        updated = self.cit_client.get(citation_id)
+        if (
+            updated.status == self.TARGET_STATUS
+            and self._is_binary_flag(updated.exp_list_exp_data)
+            and self._is_binary_flag(updated.exp_data)
+        ):
+            # LLM sometimes sets both flags but forgets to call advance_to_status_5.
+            self._advance_status(
+                citation_id,
+                self.NEXT_STATUS,
+                "Auto-advanced: both review flags are set (exp_list_exp_data and exp_data).",
+            )
+            updated = self.cit_client.get(citation_id)
+
+        return AgentResult(
+            success=(updated.status == self.NEXT_STATUS),
+            citation_id=citation_id,
+            status_before=status_before,
+            status_after=updated.status,
+            message=result_text[:300] if result_text else "(no output)",
         )

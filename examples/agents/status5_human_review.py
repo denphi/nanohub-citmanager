@@ -12,6 +12,10 @@ decision (approve → PUBLISHED=100, or reject → negative status).
 
 import json
 import re
+import os
+import tempfile
+import unicodedata
+from urllib.parse import unquote_plus
 from typing import Any, Dict, List
 
 try:
@@ -55,14 +59,319 @@ def _extract_date_from_html(html: str) -> str:
         m = re.search(p, html)
         if not m:
             continue
+        raw = unquote_plus((m.group(1) or "").strip()).replace("+", " ")
+        m2 = re.search(r"\b(\d{4})[-/](\d{1,2})[-/](\d{1,2})\b", raw)
+        if m2:
+            return f"{int(m2.group(1)):04d}-{int(m2.group(2)):02d}-{int(m2.group(3)):02d}"
+        m_day_month = re.search(r"\b(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})\b", raw)
+        if m_day_month:
+            month_map = {
+                "january": "01", "february": "02", "march": "03", "april": "04",
+                "may": "05", "june": "06", "july": "07", "august": "08",
+                "september": "09", "october": "10", "november": "11", "december": "12",
+            }
+            mm = month_map.get((m_day_month.group(2) or "").lower())
+            if mm:
+                return f"{int(m_day_month.group(3)):04d}-{mm}-{int(m_day_month.group(1)):02d}"
+        m3 = re.search(r"\b(19|20)\d{2}\b", raw)
+        if m3:
+            return f"{int(m3.group(0)):04d}-01-01"
+
+    raw_patterns = [
+        r'(?is)\bpublicationDate=([^&"\']+)',
+        r'(?is)"displayPublicationDate"\s*:\s*"([^"]+)"',
+        r'(?is)"dateOfInsertion"\s*:\s*"([^"]+)"',
+    ]
+    month_map = {
+        "january": "01", "february": "02", "march": "03", "april": "04",
+        "may": "05", "june": "06", "july": "07", "august": "08",
+        "september": "09", "october": "10", "november": "11", "december": "12",
+    }
+    for p in raw_patterns:
+        m = re.search(p, html)
+        if not m:
+            continue
+        raw = unquote_plus((m.group(1) or "").strip()).replace("+", " ")
+        m2 = re.search(r"\b(\d{4})[-/](\d{1,2})[-/](\d{1,2})\b", raw)
+        if m2:
+            return f"{int(m2.group(1)):04d}-{int(m2.group(2)):02d}-{int(m2.group(3)):02d}"
+        m3 = re.search(r"\b(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})\b", raw)
+        if m3:
+            mm = month_map.get((m3.group(2) or "").lower())
+            if mm:
+                return f"{int(m3.group(3)):04d}-{mm}-{int(m3.group(1)):02d}"
+
+    # Visible-text fallback for pages where date is rendered, not in meta tags
+    text = re.sub(r"(?is)<script\b.*?>.*?</script>", " ", html)
+    text = re.sub(r"(?is)<style\b.*?>.*?</style>", " ", text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    visible_patterns = [
+        r"(?:Date\s+of\s+Publication|Publication\s+Date)\s*[:\-]?\s*(\d{1,2}\s+[A-Za-z]+\s+\d{4})",
+        r"(?:Date\s+of\s+Publication|Publication\s+Date)\s*[:\-]?\s*([A-Za-z]+\s+\d{1,2},\s+\d{4})",
+        r"(?:Date\s+of\s+Publication|Publication\s+Date)\s*[:\-]?\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2})",
+        r"First\s+Online\s*[:\-]?\s*(\d{1,2}\s+[A-Za-z]+\s+\d{4})",
+        r"First\s+Online\s*[:\-]?\s*([A-Za-z]+\s+\d{1,2},\s+\d{4})",
+        r"First\s+Online\s*[:\-]?\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2})",
+        r"Published(?:\s+online)?\s*[:\-]?\s*(\d{1,2}\s+[A-Za-z]+\s+\d{4})",
+        r"Published(?:\s+online)?\s*[:\-]?\s*([A-Za-z]+\s+\d{1,2},\s+\d{4})",
+        r"Published(?:\s+online)?\s*[:\-]?\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2})",
+    ]
+    month_map = {
+        "january": "01", "february": "02", "march": "03", "april": "04",
+        "may": "05", "june": "06", "july": "07", "august": "08",
+        "september": "09", "october": "10", "november": "11", "december": "12",
+    }
+    for p in visible_patterns:
+        m = re.search(p, text, re.IGNORECASE)
+        if not m:
+            continue
         raw = (m.group(1) or "").strip()
         m2 = re.search(r"\b(\d{4})[-/](\d{1,2})[-/](\d{1,2})\b", raw)
         if m2:
             return f"{int(m2.group(1)):04d}-{int(m2.group(2)):02d}-{int(m2.group(3)):02d}"
-        m3 = re.search(r"\b(19|20)\d{2}\b", raw)
+        m3 = re.search(r"\b(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})\b", raw)
         if m3:
-            return f"{int(m3.group(0)):04d}-01-01"
+            mm = month_map.get((m3.group(2) or "").lower())
+            if mm:
+                return f"{int(m3.group(3)):04d}-{mm}-{int(m3.group(1)):02d}"
+        m4 = re.search(r"\b([A-Za-z]+)\s+(\d{1,2}),\s*(\d{4})\b", raw)
+        if m4:
+            mm = month_map.get((m4.group(1) or "").lower())
+            if mm:
+                return f"{int(m4.group(3)):04d}-{mm}-{int(m4.group(2)):02d}"
+        m5 = re.search(r"\b(19|20)\d{2}\b", raw)
+        if m5:
+            return f"{int(m5.group(0)):04d}-01-01"
     return ""
+
+
+def _norm(s: Any) -> str:
+    return re.sub(r"\s+", " ", str(s or "")).strip().lower()
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(str(value).strip())
+    except Exception:
+        return 0
+
+
+_BAD_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
+
+
+def _sanitize_for_llm(text: str, max_chars: int = 4000) -> str:
+    """Normalize notes text into transport-safe compact content."""
+    if not text:
+        return ""
+    t = str(text)
+    t = _BAD_CONTROL_CHARS_RE.sub("", t)
+    t = _SURROGATE_RE.sub("", t)
+    t = t.encode("utf-8", errors="replace").decode("utf-8")
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
+    if len(t) > max_chars:
+        t = t[:max_chars] + f"\n...[truncated {len(t) - max_chars} chars]"
+    return t
+
+
+def _compact_pipeline_notes(notes: str, max_lines: int = 60, max_chars: int = 4000) -> str:
+    """
+    Return only the most relevant pipeline log lines to keep LLM context small/stable.
+    """
+    if not notes:
+        return ""
+    lines = [ln.strip() for ln in str(notes).splitlines() if ln.strip()]
+    important = [
+        ln for ln in lines
+        if ("[Agent/" in ln)
+        or ("[INCOMPLETE]" in ln)
+        or ("[WARNING]" in ln)
+        or ("HUMAN REVIEW SUMMARY" in ln)
+    ]
+    selected = important if important else lines
+    compact = "\n".join(selected[-max_lines:])
+    return _sanitize_for_llm(compact, max_chars=max_chars)
+
+
+def _fix_mojibake(text: str) -> str:
+    """Repeatedly decode latin1-as-utf8 mojibake until stable."""
+    t = text or ""
+    for _ in range(6):
+        try:
+            fixed = t.encode("latin-1").decode("utf-8")
+        except Exception:
+            break
+        if fixed == t:
+            break
+        t = fixed
+    return t
+
+
+def _clean_field_text(text: str, max_chars: int = 12000) -> str:
+    """
+    Clean corrupted field text (title/abstract), removing repeated mojibake
+    noise while preserving valid prose.
+    """
+    if not text:
+        return ""
+    t = _fix_mojibake(str(text))
+    t = _BAD_CONTROL_CHARS_RE.sub("", t)
+    t = _SURROGATE_RE.sub("", t)
+
+    # Remove long repeated mojibake blocks like "Ã?Â??Ã?Â???..."
+    t = re.sub(r"(?:Ã\?Â\?+|Ã\?Â|Ã\?|Ã|Â|\?){20,}", " ", t)
+    t = re.sub(r"�{2,}", " ", t)
+
+    # Normalize unicode and spacing
+    t = unicodedata.normalize("NFKC", t)
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
+    if len(t) > max_chars:
+        t = t[:max_chars].rstrip() + " ..."
+    return t
+
+
+def _detect_nanohub_evidence(citation) -> Dict[str, Any]:
+    """
+    Detect explicit nanoHUB/NCN evidence from citation text fields.
+    Returns {'found': bool, 'matches': [..]}.
+    """
+    blobs = [
+        ("title", citation.title or ""),
+        ("abstract", citation.abstract or ""),
+        ("notes", citation.notes or ""),
+        ("url", citation.url or ""),
+        ("ref_type", citation.ref_type or ""),
+    ]
+    patterns = [
+        r"\bnanohub\b",
+        r"\bnano[-\s]?hub\b",
+        r"\bnetwork for computational nanotechnology\b",
+        r"\bncn\b",
+    ]
+    matches: List[str] = []
+    for field, text in blobs:
+        t = (text or "").lower()
+        for p in patterns:
+            if re.search(p, t):
+                matches.append(f"{field}:{p}")
+                break
+    return {"found": len(matches) > 0, "matches": matches}
+
+
+def _detect_nanohub_evidence_in_pdf(cit_client, citation_id: int) -> Dict[str, Any]:
+    """
+    Scan PDF text for nanoHUB/NCN evidence.
+    """
+    try:
+        from PyPDF2 import PdfReader
+    except Exception:
+        return {"found": False, "matches": [], "error": "PyPDF2 not available"}
+
+    fd, path = tempfile.mkstemp(suffix=".pdf")
+    os.close(fd)
+    try:
+        cit_client.download_pdf(citation_id, path)
+        reader = PdfReader(path)
+        text = "\n".join((p.extract_text() or "") for p in reader.pages)
+        low = text.lower()
+
+        patterns = [
+            r"\bnanohub\b",
+            r"\bnano[-\s]?hub\b",
+            r"\bnetwork for computational nanotechnology\b",
+            r"\bncn\b",
+            r"\bnanohub\.org\b",
+        ]
+        matches: List[str] = []
+        for p in patterns:
+            if re.search(p, low):
+                matches.append(f"pdf:{p}")
+        return {"found": len(matches) > 0, "matches": matches}
+    except Exception as exc:
+        return {"found": False, "matches": [], "error": str(exc)}
+    finally:
+        try:
+            os.unlink(path)
+        except Exception:
+            pass
+
+
+def _extract_urls(text: str) -> List[str]:
+    if not text:
+        return []
+    urls = re.findall(r"https?://[^\s<>\"]+", text, flags=re.IGNORECASE)
+    out: List[str] = []
+    seen = set()
+    for u in urls:
+        u = u.strip().rstrip(").,;")
+        k = u.lower()
+        if not u or k in seen:
+            continue
+        seen.add(k)
+        out.append(u)
+    return out
+
+
+def _build_association_context(citation) -> Dict[str, Any]:
+    """
+    Build best-effort association context from citation fields/notes.
+    """
+    links: List[str] = []
+    if citation.url:
+        links.append(citation.url.strip())
+    links.extend(_extract_urls(citation.notes or ""))
+    links.extend(_extract_urls(citation.abstract or ""))
+    # de-dup
+    uniq_links: List[str] = []
+    seen = set()
+    for u in links:
+        k = u.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        uniq_links.append(u)
+
+    parsed = []
+    for u in uniq_links:
+        lu = u.lower()
+        if "nanohub.org/resources/" in lu or "nanohub.org/tools/" in lu:
+            m = re.search(r"nanohub\.org/(?:resources?|tools)/([A-Za-z0-9_\-]+)", u, re.IGNORECASE)
+            parsed.append({
+                "type": "resource",
+                "id_or_alias": m.group(1) if m else "",
+                "url": u,
+                "explanation": "nanoHUB tool/resource reference detected in citation context.",
+            })
+        elif "nanohub.org/publications/" in lu:
+            m = re.search(r"nanohub\.org/publications/(\d+)", u, re.IGNORECASE)
+            parsed.append({
+                "type": "publication",
+                "id_or_alias": m.group(1) if m else "",
+                "url": u,
+                "explanation": "nanoHUB publication reference detected in citation context.",
+            })
+        elif "nanohub.org/" in lu:
+            parsed.append({
+                "type": "link",
+                "id_or_alias": "1",
+                "url": u,
+                "explanation": "Generic nanoHUB page citation (mapped as link:1).",
+            })
+        elif "/doi/" in lu or "doi.org/" in lu:
+            parsed.append({
+                "type": "evidence_url",
+                "id_or_alias": "",
+                "url": u,
+                "explanation": "Publisher DOI page used as bibliographic evidence source.",
+            })
+
+    return {
+        "count": len(parsed),
+        "items": parsed[:30],
+    }
 
 
 class HumanReviewAgent(BaseCitationAgent):
@@ -91,7 +400,8 @@ class HumanReviewAgent(BaseCitationAgent):
             "Workflow:\n"
             "1. Call `get_citation_details` to retrieve all metadata.\n"
             "2. Call `get_pipeline_history` to retrieve the agent notes recorded in previous stages.\n"
-            "3. Synthesize the information and call `write_review_summary` with a structured "
+            "3. Call `get_association_context` to retrieve related associations/links.\n"
+            "4. Synthesize the information and call `write_review_summary` with a structured "
             "summary that includes ALL of the following sections:\n\n"
             "   [1] BIBLIOGRAPHIC OVERVIEW\n"
             "       Title, authors, year, publication name, DOI, ref_type, dates (received/accepted)\n\n"
@@ -118,7 +428,10 @@ class HumanReviewAgent(BaseCitationAgent):
             "       - REJECT        : citation has no apparent nanoHUB/NCN connection\n"
             "       - NEEDS ATTENTION: incomplete fields, duplicate concerns, or ambiguous connection\n"
             "       Follow the recommendation with a single sentence explaining the reason.\n\n"
-            "4. End with a plain-text confirmation that the summary has been written.\n\n"
+            "   [8] ASSOCIATIONS\n"
+            "       List any related associations and explain each briefly: "
+            "resource/publication/link/evidence URLs.\n\n"
+            "5. End with a plain-text confirmation that the summary has been written.\n\n"
             "The human reviewer will read only the notes field — make the summary self-contained "
             "and easy to scan. Use clear section headers and bullet points."
         )
@@ -145,6 +458,20 @@ class HumanReviewAgent(BaseCitationAgent):
                 "description": (
                     "Retrieve the notes field of the citation, which contains the log of "
                     "actions taken by each preceding pipeline agent."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "citation_id": {"type": "integer"}
+                    },
+                    "required": ["citation_id"],
+                },
+            },
+            {
+                "name": "get_association_context",
+                "description": (
+                    "Return best-effort association context derived from citation URL/notes/abstract, "
+                    "including resource/publication/link references and evidence URLs."
                 ),
                 "input_schema": {
                     "type": "object",
@@ -193,8 +520,12 @@ class HumanReviewAgent(BaseCitationAgent):
         if name == "get_pipeline_history":
             try:
                 citation = self.cit_client.get(cid)
+                raw_notes = citation.notes or ""
+                compact_notes = _compact_pipeline_notes(raw_notes)
                 return {
-                    "notes": citation.notes or "(no notes recorded)",
+                    "notes": compact_notes or "(no notes recorded)",
+                    "notes_full_length": len(raw_notes),
+                    "notes_compacted": bool(raw_notes and compact_notes != raw_notes),
                     "exp_list_exp_data": citation.exp_list_exp_data,
                     "exp_data": citation.exp_data,
                     "affiliated": citation.affiliated,
@@ -204,14 +535,58 @@ class HumanReviewAgent(BaseCitationAgent):
             except Exception as exc:
                 return {"error": str(exc)}
 
+        if name == "get_association_context":
+            try:
+                citation = self.cit_client.get(cid)
+                return _build_association_context(citation)
+            except Exception as exc:
+                return {"error": str(exc)}
+
         if name == "write_review_summary":
             summary = input_data.get("summary", "")
             try:
                 citation = self.cit_client.get(cid)
+                field_evidence = _detect_nanohub_evidence(citation)
+                pdf_evidence = _detect_nanohub_evidence_in_pdf(self.cit_client, cid)
+                evidence_found = bool(field_evidence.get("found") or pdf_evidence.get("found"))
+                assoc_ctx = _build_association_context(citation)
+
+                # Guardrail: don't allow REJECT if explicit nanoHUB/NCN evidence exists.
+                if evidence_found:
+                    if re.search(r"\bREJECT\b", summary, re.IGNORECASE):
+                        summary = re.sub(
+                            r"\bREJECT\b",
+                            "NEEDS ATTENTION",
+                            summary,
+                            count=1,
+                            flags=re.IGNORECASE,
+                        )
+                        summary += (
+                            "\n\n[Auto-guard] Recommendation adjusted from REJECT to NEEDS ATTENTION "
+                            "because explicit nanoHUB/NCN evidence was detected "
+                            "in citation fields and/or PDF text."
+                        )
+
+                # Ensure ASSOCIATIONS section exists in final summary.
+                if not re.search(r"\bASSOCIATIONS\b", summary, re.IGNORECASE):
+                    lines = ["\n[8] ASSOCIATIONS"]
+                    if assoc_ctx.get("count", 0) == 0:
+                        lines.append("- No explicit association URLs found in citation fields/notes.")
+                    else:
+                        for item in assoc_ctx.get("items", [])[:10]:
+                            atype = item.get("type", "link")
+                            ident = item.get("id_or_alias", "")
+                            ident_txt = f": {ident}" if ident else ""
+                            lines.append(
+                                f"- {atype}{ident_txt} -> {item.get('url', '')} "
+                                f"({item.get('explanation', '')})"
+                            )
+                    summary = summary.rstrip() + "\n" + "\n".join(lines)
+
                 # Prepend the human review summary at the top of notes,
                 # keeping previous agent logs below a separator.
                 existing = citation.notes or ""
-                separator = "\n" + "─" * 50 + "\n[Previous pipeline logs]\n"
+                separator = "\n" + "-" * 50 + "\n[Previous pipeline logs]\n"
                 if "[Agent/" in existing:
                     citation.notes = (
                         f"[HUMAN REVIEW SUMMARY — Agent/{self.STAGE_NAME}]\n"
@@ -253,6 +628,190 @@ class HumanReviewAgent(BaseCitationAgent):
     # ------------------------------------------------------------------
     # Override run() — success = summary written (not status advance)
     # ------------------------------------------------------------------
+
+    def _extract_member_candidates(self, payload: Any) -> List[Dict[str, Any]]:
+        """Normalize different members/list payload shapes into candidate dicts."""
+        out: List[Dict[str, Any]] = []
+
+        def _walk(node: Any):
+            if isinstance(node, dict):
+                keys = {k.lower() for k in node.keys()}
+                if (
+                    "uidnumber" in keys
+                    or "username" in keys
+                    or "email" in keys
+                    or "name" in keys
+                ):
+                    out.append(node)
+                for v in node.values():
+                    _walk(v)
+            elif isinstance(node, list):
+                for item in node:
+                    _walk(item)
+
+        _walk(payload)
+        return out
+
+    def _find_best_member_match(self, author: Dict[str, Any], candidates: List[Dict[str, Any]]) -> int:
+        """Score candidates by email/name and return best uidNumber (or 0)."""
+        if not candidates:
+            return 0
+
+        fn = _norm(author.get("firstname") or author.get("firstName"))
+        ln = _norm(author.get("lastname") or author.get("lastName"))
+        fullname = _norm(f"{fn} {ln}")
+        email = _norm(author.get("email"))
+
+        best_uid = 0
+        best_score = -1
+
+        for c in candidates:
+            uid = _safe_int(c.get("uidNumber") or c.get("uidnumber") or c.get("id"))
+            if uid <= 0:
+                continue
+
+            c_name = _norm(c.get("name"))
+            c_username = _norm(c.get("username"))
+            c_email = _norm(c.get("email"))
+            c_fullname = _norm(
+                f"{c.get('firstname') or c.get('firstName') or ''} {c.get('lastname') or c.get('lastName') or ''}"
+            )
+
+            score = 0
+            if email and c_email and email == c_email:
+                score += 10
+            if fullname and c_name and fullname == c_name:
+                score += 8
+            if fullname and c_fullname and fullname == c_fullname:
+                score += 8
+            if ln and c_name and ln in c_name:
+                score += 2
+            if fn and c_name and fn in c_name:
+                score += 1
+            if fn and ln and c_username and (fn in c_username or ln in c_username):
+                score += 1
+
+            if score > best_score:
+                best_score = score
+                best_uid = uid
+
+        # Require at least some credible match signal.
+        return best_uid if best_score >= 3 else 0
+
+    def _enrich_nanohub_ids(self, citation_id: int) -> Dict[str, Any]:
+        """
+        Resolve nanoHUB IDs (cid) for authors using members/list endpoint.
+        """
+        if _requests is None:
+            return {"ok": False, "error": "requests module is not available"}
+
+        citation = self.cit_client.get(citation_id)
+        authors = list(citation.authors or [])
+        if not authors:
+            return {"ok": True, "updated": 0, "checked": 0}
+
+        endpoint = "https://nanohub.org/api/members/list"
+        checked = 0
+        updated = 0
+
+        for idx, author in enumerate(authors):
+            if not isinstance(author, dict):
+                continue
+
+            existing_cid = _safe_int(author.get("cid"))
+            if existing_cid > 0:
+                continue
+
+            checked += 1
+            email = (author.get("email") or "").strip()
+            firstname = (author.get("firstname") or author.get("firstName") or "").strip()
+            lastname = (author.get("lastname") or author.get("lastName") or "").strip()
+            name_query = f"{firstname} {lastname}".strip()
+
+            search_terms = []
+            if email:
+                search_terms.append(email)
+            if name_query:
+                search_terms.append(name_query)
+
+            best_uid = 0
+            for term in search_terms:
+                try:
+                    resp = _requests.get(
+                        endpoint,
+                        params={"search": term},
+                        timeout=12,
+                        headers={"accept": "application/json"},
+                    )
+                    if resp.status_code >= 400:
+                        continue
+                    payload = resp.json()
+                    candidates = self._extract_member_candidates(payload)
+                    best_uid = self._find_best_member_match(author, candidates)
+                    if best_uid > 0:
+                        break
+                except Exception:
+                    continue
+
+            if best_uid > 0:
+                authors[idx]["cid"] = best_uid
+                updated += 1
+
+        if updated == 0:
+            return {"ok": True, "updated": 0, "checked": checked}
+
+        # Avoid sending personId/id so backend applies mapped fields (including cid).
+        sanitized_authors: List[Dict[str, Any]] = []
+        for a in authors:
+            if not isinstance(a, dict):
+                continue
+            b = dict(a)
+            b.pop("id", None)
+            b.pop("personId", None)
+            b.pop("personid", None)
+            sanitized_authors.append(b)
+
+        citation.authors = sanitized_authors
+        existing = citation.notes or ""
+        sep = "\n" if existing else ""
+        citation.notes = f"{existing}{sep}[Agent/{self.STAGE_NAME}] Auto-enriched nanoHUB IDs for {updated} author(s)."
+        self.cit_client.update(citation)
+        return {"ok": True, "updated": updated, "checked": checked}
+
+    def _sanitize_text_fields(self, citation_id: int) -> Dict[str, Any]:
+        """
+        Validate/clean title and abstract for encoding-noise corruption.
+        """
+        try:
+            citation = self.cit_client.get(citation_id)
+            changed_fields: List[str] = []
+            old_title = citation.title or ""
+            old_abstract = citation.abstract or ""
+
+            new_title = _clean_field_text(old_title, max_chars=600)
+            new_abstract = _clean_field_text(old_abstract, max_chars=12000)
+
+            # Only persist meaningful, non-destructive changes.
+            if new_title and new_title != old_title and len(new_title) >= max(8, int(len(old_title) * 0.35)):
+                citation.title = new_title
+                changed_fields.append("title")
+            if new_abstract and new_abstract != old_abstract and len(new_abstract) >= max(50, int(len(old_abstract) * 0.25)):
+                citation.abstract = new_abstract
+                changed_fields.append("abstract")
+
+            if not changed_fields:
+                return {"ok": True, "changed": []}
+
+            existing = citation.notes or ""
+            sep = "\n" if existing else ""
+            citation.notes = (
+                f"{existing}{sep}[Agent/{self.STAGE_NAME}] "
+                f"Cleaned encoding noise in fields: {', '.join(changed_fields)}."
+            )
+            self.cit_client.update(citation)
+            return {"ok": True, "changed": changed_fields}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
 
     def _ensure_publish_date(self, citation_id: int) -> Dict[str, Any]:
         """
@@ -328,6 +887,23 @@ class HumanReviewAgent(BaseCitationAgent):
         print(f"\n{'─'*60}")
         print(f"  [{self.STAGE_NAME.upper()}] citation {citation_id}  (current status={status_before})")
         print(f"{'─'*60}")
+
+        text_fix_result = self._sanitize_text_fields(citation_id)
+        if text_fix_result.get("ok"):
+            changed = text_fix_result.get("changed") or []
+            if changed:
+                print(f"  [human_review] cleaned text fields: {', '.join(changed)}")
+        else:
+            print(f"  [human_review] warning: {text_fix_result.get('error')}")
+
+        cid_result = self._enrich_nanohub_ids(citation_id)
+        if cid_result.get("ok"):
+            print(
+                "  [human_review] nanoHUB ID enrichment: "
+                f"updated={cid_result.get('updated', 0)} checked={cid_result.get('checked', 0)}"
+            )
+        else:
+            print(f"  [human_review] warning: {cid_result.get('error')}")
 
         publish_date_result = self._ensure_publish_date(citation_id)
         if publish_date_result.get("ok"):
