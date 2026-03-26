@@ -272,6 +272,12 @@ class Citation:
                 mapped_key = key_mapping.get(key, key)
                 normalized_author[mapped_key] = value
 
+            # Backend requires both first and last names.
+            first_name = str(normalized_author.get('firstName') or '').strip()
+            last_name = str(normalized_author.get('lastName') or '').strip()
+            if not first_name or not last_name:
+                continue
+
             normalized.append(normalized_author)
 
         return normalized

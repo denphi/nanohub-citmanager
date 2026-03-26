@@ -47,9 +47,15 @@ setup(
     ],
     python_requires=">=3.8",
     install_requires=[
-        "nanohubremote>=0.2.0",
+        "nanohub-remote>=0.2.0",
         "requests>=2.25.0",
+        "networkx>=2.6",
     ],
+    entry_points={
+        "console_scripts": [
+            "nhnetgen=nanohubcitmanager.visualization.NanoHUBAnimationGenerator:main",
+        ],
+    },
     extras_require={
         "dev": [
             "pytest>=6.0",

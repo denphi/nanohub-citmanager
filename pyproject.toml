@@ -13,9 +13,13 @@ authors = [
     {name = "Daniel Mejia", email = "denphi@denphi.com"}
 ]
 dependencies = [
-    "nanohubremote>=0.2.0",
+    "nanohub-remote>=0.2.0",
     "requests>=2.25.0",
+    "networkx>=2.6",
 ]
+
+[project.scripts]
+nhnetgen = "nanohubcitmanager.visualization.NanoHUBAnimationGenerator:main"
 
 [project.optional-dependencies]
 dev = [
