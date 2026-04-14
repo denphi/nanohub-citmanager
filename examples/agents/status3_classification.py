@@ -42,34 +42,30 @@ from .base_agent import BaseCitationAgent
 
 def _extract_nanohub_urls(text: str) -> List[str]:
     """
-    Extract nanoHUB URLs from text, including schema-less forms.
+    Extract nanoHUB and ChipsHub URLs from text, including schema-less forms.
     """
     if not text:
         return []
-    raw = re.findall(r"(https?://)?(?:www\.)?nanohub\.org/[^\s<>\]\"')]+", text, re.IGNORECASE)
-    # regex with optional group returns tuples/strings depending on engine path; normalize
-    urls = []
-    if raw and isinstance(raw[0], tuple):
-        # fallback path if groups captured
-        raw_iter = re.finditer(r"((?:https?://)?(?:www\.)?nanohub\.org/[^\s<>\]\"')]+)", text, re.IGNORECASE)
-        urls = [m.group(1) for m in raw_iter]
-    else:
-        raw_iter = re.finditer(r"((?:https?://)?(?:www\.)?nanohub\.org/[^\s<>\]\"')]+)", text, re.IGNORECASE)
-        urls = [m.group(1) for m in raw_iter]
 
     out: List[str] = []
-    seen = set()
-    for u in urls:
-        u = u.strip().rstrip(".,;:)]")
-        if not u:
-            continue
-        if not re.match(r"^https?://", u, re.IGNORECASE):
-            u = "https://" + u
-        k = u.lower()
-        if k in seen:
-            continue
-        seen.add(k)
-        out.append(u)
+    seen: set = set()
+
+    for pattern in [
+        r"((?:https?://)?(?:www\.)?nanohub\.org/[^\s<>\]\"')]+)",
+        r"((?:https?://)?(?:www\.)?chipshub\.org/[^\s<>\]\"')]+)",
+    ]:
+        raw_iter = re.finditer(pattern, text, re.IGNORECASE)
+        for m in raw_iter:
+            u = m.group(1).strip().rstrip(".,;:)]")
+            if not u:
+                continue
+            if not re.match(r"^https?://", u, re.IGNORECASE):
+                u = "https://" + u
+            k = u.lower()
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(u)
     return out
 
 
@@ -171,16 +167,21 @@ def _is_scholar_captcha_page(html: str, status_code: int) -> bool:
 
 def _resolve_nanohub_association(url_or_token: str) -> Optional[Dict[str, Any]]:
     """
-    Resolve a nanoHUB URL/token to a DocumentAssociation tuple.
+    Resolve a nanoHUB or ChipsHub URL/token to a DocumentAssociation tuple.
 
     Mapping rules:
-      - /resources/<id|alias>, /tools/<id|alias> -> assocName='resource'
-      - /publications/<id>/...                   -> assocName='publication'
-      - any other nanohub.org page              -> assocName='link', assocID=1
+      - nanohub.org /resources/<id|alias>, /tools/<id|alias> -> assocName='resource'
+      - nanohub.org /publications/<id>/...                   -> assocName='publication'
+      - any other nanohub.org page                           -> assocName='link', assocID=1
+      - any chipshub.org page                                -> assocName='link', assocID=2
     """
     token = (url_or_token or "").strip()
     if not token:
         return None
+
+    # ChipsHub pages -> link:2
+    if re.search(r"chipshub\.org/", token, re.IGNORECASE):
+        return {"assoc_name": "link", "assoc_id": 2, "source": token}
 
     # Backward compatibility: bare numeric token is treated as resource ID
     if token.isdigit():
@@ -305,14 +306,23 @@ RECOMMENDED_FIELDS = [
     "date_publish",
 ]
 
-# NCN / nanoHUB keywords to detect affiliation
+# NCN / nanoHUB / ChipsHub keywords to detect affiliation
 _NCN_KEYWORDS = [
     "nanohub", "nano-hub", "ncn", "network for computational nanotechnology",
+    "chipshub", "chips-hub",
 ]
 _NCN_STRICT_PATTERNS = [
     r"\bnetwork for computational nanotechnology\b",
     r"\b(?:the\s+)?ncn\b",
     r"\bncn[-\s]*(?:purdue|center|centre|program|initiative)\b",
+]
+
+# Known NCN-affiliated researcher names (first last, lowercase)
+_NCN_RESEARCHER_NAMES = [
+    "matthew morrison",
+    "daniel mejia",
+    "andrew kahng",
+    "vidya chhabria",
 ]
 
 
@@ -602,7 +612,7 @@ def _apply_web_author_affiliations(citation, pairs: List[Dict[str, str]]) -> int
             if "center" in first_chunk.lower() or "department" in first_chunk.lower() or "school" in first_chunk.lower():
                 a["organizationdept"] = first_chunk
         if not a.get("organizationtype"):
-            a["organizationtype"] = "Education"
+            a["organizationtype"] = _infer_org_type(aff)
         updated += 1
 
     return updated
@@ -731,7 +741,8 @@ def _extract_publication_name_from_html_or_text(html: str, text: str) -> Optiona
 
 def _detect_nanohub_in_text(text: str) -> Dict[str, Any]:
     """
-    Detect nanoHUB/NCN evidence from full text and return matching snippets.
+    Detect nanoHUB/NCN/ChipsHub evidence from full text and return matching snippets.
+    Also detects known NCN-affiliated researcher names.
     """
     if not text:
         return {"found": False, "matches": []}
@@ -742,7 +753,14 @@ def _detect_nanohub_in_text(text: str) -> Dict[str, Any]:
         r"\bnanohub\.org\b",
         r"\bncn\b",
         r"\bnetwork for computational nanotechnology\b",
+        r"\bchipshub\b",
+        r"\bchips[-\s]?hub\b",
+        r"\bchipshub\.org\b",
     ]
+    # Add NCN researcher name patterns
+    for name in _NCN_RESEARCHER_NAMES:
+        patterns.append(r"\b" + re.escape(name) + r"\b")
+
     matches: List[str] = []
     for p in patterns:
         m = re.search(p, low)
@@ -820,8 +838,20 @@ def _extract_submission_dates(text: str) -> Dict[str, Optional[str]]:
 
 
 def _fix_mojibake(text: str) -> str:
-    """Repeatedly decode latin-1-as-UTF-8 mojibake until the text stabilises."""
-    for _ in range(6):  # up to 6 layers of mis-encoding
+    """
+    Fix latin-1-as-UTF-8 mojibake in two passes.
+
+    Pass 1 — standard multi-layer latin-1→UTF-8 unwinding (up to 6 layers).
+              Recovers cases like 'ÃƒÂ©' → 'é', 'Ã¢â‚¬â€œ' → '—'.
+
+    Pass 2 — strip unrecoverable Ã?/Â? noise runs.
+              These arise when UTF-8 high bytes were encoded as latin-1 but
+              their continuation bytes were lost or replaced with '?' (0x3F),
+              producing strings like 'Ã?Â??Ã?Â???…'.  They cannot be decoded
+              back to the original characters; the only safe option is removal.
+    """
+    # Pass 1: unwind recoverable layers
+    for _ in range(6):
         try:
             fixed = text.encode("latin-1").decode("utf-8")
         except (UnicodeEncodeError, UnicodeDecodeError):
@@ -829,14 +859,49 @@ def _fix_mojibake(text: str) -> str:
         if fixed == text:
             break
         text = fixed
+
+    # Pass 2: strip unrecoverable Ã?/Â? mojibake noise.
+    # Recoverable mojibake (e.g. 'Ã¢â‚¬â€œ' → em-dash) contains only
+    # printable latin-1 chars and no '?' replacements — pass 1 handles those.
+    # Unrecoverable runs contain '?' where continuation bytes were lost.
+    # Pattern: runs of [ÃÂ<non-word>] or bare '?' that include at least one
+    # Ã/Â anchor, replace with a space to avoid fusing adjacent words.
+    text = re.sub(r"(?=[ÃÂ?])(?:[ÃÂ][^\w\s]|[?])+", " ", text)
+    text = re.sub(r"[ \t]{2,}", " ", text).strip()
     return text
 
 
 def _ascii(text: str) -> str:
-    """Normalize unicode to ASCII for safe API storage."""
+    """
+    Normalize unicode to ASCII for safe API storage.
+
+    Uses NFKD decomposition to strip combining accents (é→e, ü→u, ñ→n).
+    Characters that don't decompose to an ASCII base (ø, ß, ł, æ, etc.)
+    are transliterated explicitly so names are not silently truncated.
+    """
     if not text:
         return ""
     text = _fix_mojibake(text)
+
+    # Explicit transliteration for characters that NFKD won't reduce to ASCII.
+    _TRANSLITERATE = {
+        "ß": "ss", "æ": "ae", "Æ": "Ae", "œ": "oe", "Œ": "Oe",
+        "ø": "o",  "Ø": "O",  "ł": "l",  "Ł": "L",  "đ": "d",  "Đ": "D",
+        "ð": "d",  "Ð": "D",  "þ": "th", "Þ": "Th", "ħ": "h",  "Ħ": "H",
+        "ı": "i",  "ŋ": "n",  "ə": "e",  "ɨ": "i",
+        # Turkish letters not handled by NFKD decomposition
+        "İ": "I",  "ğ": "g",  "Ğ": "G",  "ş": "s",  "Ş": "S",
+        # Spanish/Portuguese tilde-n (ñ decomposes via NFKD but mapping ensures it)
+        "ñ": "n",  "Ñ": "N",
+        # Common ligatures
+        "ﬁ": "fi", "ﬂ": "fl", "ﬀ": "ff", "ﬃ": "ffi", "ﬄ": "ffl",
+        # Typographic quotes / dashes that break encoding
+        "\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"',
+        "\u2013": "-", "\u2014": "-",
+    }
+    for src, dst in _TRANSLITERATE.items():
+        text = text.replace(src, dst)
+
     normalized = unicodedata.normalize("NFKD", text)
     return normalized.encode("ascii", "ignore").decode("ascii").strip()
 
@@ -845,15 +910,72 @@ def _clean_text(text: str) -> str:
     """Clean PDF-extracted text: fix mojibake, normalize unicode, drop non-ASCII."""
     if not text:
         return ""
-    text = _fix_mojibake(text)
-    # NFKD decomposes accented characters (é → e + combining accent)
-    normalized = unicodedata.normalize("NFKD", text)
-    # Drop combining/non-ASCII characters
-    cleaned = normalized.encode("ascii", "ignore").decode("ascii")
-    # Collapse extra whitespace left by dropped characters
+    # Reuse _ascii for consistent transliteration, then re-add newlines
+    # (which _ascii strips) by processing line by line.
+    lines = text.splitlines()
+    cleaned_lines = [_ascii(line) for line in lines]
+    cleaned = "\n".join(cleaned_lines)
+    # Collapse extra whitespace
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
+
+
+def _infer_org_type(org_name: str) -> str:
+    """
+    Infer organization type from organization name.
+    Returns one of: 'Education', 'Research', 'Government', 'Military', 'Industry'.
+    Falls back to 'Research' when no keyword matches.
+    """
+    if not org_name:
+        return "Research"
+    low = org_name.lower()
+
+    # Education: universities, colleges, schools, institutes that teach
+    _EDUCATION = [
+        "university", "universite", "universitat", "universidad", "università",
+        "college", "school of", "institute of technology", "polytechnic",
+        "ecole", "école", "hochschule", "facult", "akademi", "academy of",
+    ]
+    # Government: agencies, ministries, departments, bureaus, national labs
+    # affiliated with a government body
+    _GOVERNMENT = [
+        "department of ", "ministry of ", "bureau of ", "agency",
+        "national institute", "national lab", "national laboratory",
+        "oak ridge", "argonne", "brookhaven", "sandia", "lawrence livermore",
+        "lawrence berkeley", "los alamos", "pacific northwest", "nrel",
+        "nasa", "noaa", "nist", "nih ", "cdc", "epa ", "doe ", "nsf ",
+        "government", "federal", "state of ", "prefecture",
+    ]
+    # Military
+    _MILITARY = [
+        "army", "navy", "air force", "marine corps", "coast guard",
+        "department of defense", "dept. of defense", "dod ", "darpa",
+        "naval research", "army research", "air force research",
+        "military", "defence", "defense research",
+    ]
+    # Industry: companies, corporations, inc, ltd, llc, gmbh, etc.
+    _INDUSTRY = [
+        " inc", " inc.", " corp", " corp.", " corporation",
+        " ltd", " ltd.", " llc", " llc.", " gmbh", " s.a.", " s.a.s",
+        " co.", " co,", "technologies", "semiconductor", "microsystems",
+        "solutions", "systems inc", "electronics", "labs inc",
+    ]
+
+    # Check in priority order: Military > Government > Education > Industry > Research
+    for kw in _MILITARY:
+        if kw in low:
+            return "Military"
+    for kw in _GOVERNMENT:
+        if kw in low:
+            return "Government"
+    for kw in _EDUCATION:
+        if kw in low:
+            return "Education"
+    for kw in _INDUSTRY:
+        if kw in low:
+            return "Industry"
+    return "Research"
 
 
 def _clean_title_text(title: str) -> str:
@@ -886,6 +1008,9 @@ class ClassificationAgent(BaseCitationAgent):
     TARGET_STATUS = 3
     NEXT_STATUS = 4
 
+    # Classification prompts are complex — give more room than the base default.
+    MAX_ITERATIONS = 25
+
     _NON_BLOCKING_AUTHOR_MISSING_PREFIXES = (
         "authors.organization",
         "authors.department",
@@ -896,16 +1021,75 @@ class ClassificationAgent(BaseCitationAgent):
 
     def _prune_invalid_existing_authors(self, citation_id: int) -> Dict[str, Any]:
         """
-        Remove already-linked authors that are missing first/last names.
+        Remove already-linked authors that are:
+          - missing first/last names
+          - placeholder entries (N/A, Placeholder, Unknown…)
+          - genuine duplicates of a richer record for the same person
+            (e.g. "J. Smith" when "John Smith" is also present)
         """
+        _PLACEHOLDER_NAMES = {"n/a", "placeholder", "unknown", "author", ""}
+
+        def _richness(a: Dict) -> int:
+            score = len((a.get("firstname") or "").strip())
+            for fld in ("organizationname", "organizationdept", "email", "orcid"):
+                if (a.get(fld) or "").strip().upper() not in ("", "N/A"):
+                    score += 10
+            return score
+
         try:
             citation = self.cit_client.get(citation_id)
             removed_ids: List[int] = []
+
+            def _same_person_prune(fn_a: str, ln_a: str, fn_b: str, ln_b: str) -> bool:
+                if ln_a.lower() != ln_b.lower():
+                    return False
+                fa = fn_a.lower().rstrip(".")
+                fb = fn_b.lower().rstrip(".")
+                if fa == fb:
+                    return True
+                short, long = (fa, fb) if len(fa) <= len(fb) else (fb, fa)
+                if len(short) == 1 and long.startswith(short):
+                    return True
+                if long.startswith(short + " "):
+                    return True
+                return False
+
+            # Cluster valid authors by identity; mark invalid ones for removal
+            invalid: List[Dict] = []
+            valid_authors: List[Dict] = []
             for a in (citation.authors or []):
                 fn = (a.get("firstname") or a.get("firstName") or "").strip()
                 ln = (a.get("lastname") or a.get("lastName") or "").strip()
-                if fn and ln:
-                    continue
+                is_placeholder = fn.lower() in _PLACEHOLDER_NAMES or ln.lower() in _PLACEHOLDER_NAMES
+                if not fn or not ln or is_placeholder:
+                    invalid.append(a)
+                else:
+                    valid_authors.append(a)
+
+            # Build same-person clusters among valid authors
+            clusters: List[List[Dict]] = []
+            for rec in valid_authors:
+                fn_r = (rec.get("firstname") or "").strip()
+                ln_r = (rec.get("lastname") or "").strip()
+                placed = False
+                for cluster in clusters:
+                    rep = cluster[0]
+                    fn_c = (rep.get("firstname") or "").strip()
+                    ln_c = (rep.get("lastname") or "").strip()
+                    if _same_person_prune(fn_r, ln_r, fn_c, ln_c):
+                        cluster.append(rec)
+                        placed = True
+                        break
+                if not placed:
+                    clusters.append([rec])
+
+            to_remove: List[Dict] = list(invalid)
+            for entries in clusters:
+                if len(entries) > 1:
+                    keep = max(entries, key=_richness)
+                    to_remove.extend(e for e in entries if e is not keep)
+
+            for a in to_remove:
                 person_id = a.get("id") or a.get("personId") or a.get("personid")
                 if not person_id:
                     continue
@@ -992,7 +1176,9 @@ class ClassificationAgent(BaseCitationAgent):
             "affiliated  (integer):\n"
             "  STRICT NCN rule:\n"
             "  Set affiliated=1 ONLY when the citation has explicit NCN evidence in text,\n"
-            "  such as 'Network for Computational Nanotechnology' or clear 'NCN' references.\n"
+            "  such as 'Network for Computational Nanotechnology' or clear 'NCN' references,\n"
+            "  OR when a known NCN-affiliated researcher is listed as an author:\n"
+            "    Matthew Morrison, Daniel Mejia, Andrew Kahng, Vidya Chhabria.\n"
             "  A plain 'nanoHUB' mention by itself is NOT sufficient for affiliated=1.\n"
             "  Otherwise set affiliated=0.\n"
             "  Save with update_citation_fields({'affiliated': 1}) or 0.\n\n"
@@ -1006,6 +1192,10 @@ class ClassificationAgent(BaseCitationAgent):
             "  Save date_submit / date_accept with update_citation_fields if found in the PDF.\n"
             "  If not found, leave these fields empty — do not invent dates.\n\n"
             "authors:\n"
+            "  If there are PLACEHOLDER authors (firstname/lastname = 'Placeholder', 'N/A',\n"
+            "  'Unknown', or similar), they MUST be replaced with real author names extracted\n"
+            "  from the PDF. Call extract_pdf_text, read the author block on the first page,\n"
+            "  and call update_authors with the complete real author list.\n"
             "  If any author has organization_name = 'N/A' or empty email/orcid, call\n"
             "  extract_pdf_text to read the first page author block, then call\n"
             "  update_authors with the enriched list.\n"
@@ -1013,7 +1203,13 @@ class ClassificationAgent(BaseCitationAgent):
             "  call extract_web_context and use citation webpage/reference URLs to recover\n"
             "  organizationname/organizationdept.\n"
             "  For each author extract: organizationname, organizationdept,\n"
-            "  organizationtype (Education / Industry / Government / Research),\n"
+            "  organizationtype — MUST be exactly one of: Education, Research, Government, Military, Industry.\n"
+            "    Education  : university, college, school, polytechnic, institute of technology\n"
+            "    Research   : research institute, lab, center (not government-affiliated)\n"
+            "    Government : national lab, federal agency, ministry, department of …\n"
+            "    Military   : army, navy, air force, DARPA, defence/defense lab\n"
+            "    Industry   : company, corporation, Inc., Ltd., GmbH, LLC\n"
+            "    Do NOT use 'University', 'Academic', 'Laboratory' etc. as the type value.\n"
             "  countryresident (2-letter ISO code if determinable), email, orcid.\n"
             "  Keep firstname/lastname exactly as they already appear in the record.\n\n"
             "  IMPORTANT: Missing author detail fields (organization, department, email, ORCID, country)\n"
@@ -1022,18 +1218,20 @@ class ClassificationAgent(BaseCitationAgent):
             "date_publish:\n"
             "  If date_publish is empty, try to obtain publication date from web metadata\n"
             "  by calling extract_web_context. Save date_publish via update_citation_fields.\n\n"
-            "nanoHUB resource associations:\n"
-            "  While reading the PDF, scan for any nanoHUB URLs in the text,\n"
+            "nanoHUB / ChipsHub resource associations:\n"
+            "  While reading the PDF, scan for any nanoHUB or ChipsHub URLs in the text,\n"
             "  references, or acknowledgements. Patterns to look for:\n"
             "    https://nanohub.org/resources/<id>\n"
             "    https://nanohub.org/tools/<id>\n"
             "    https://nanohub.org/publications/<id>/...\n"
             "    nanohub.org/<any-page>\n"
+            "    chipshub.org/<any-page>\n"
             "  Association mapping:\n"
-            "    resources/tools URL -> resource:<id>\n"
-            "    publications URL    -> publication:<id>\n"
-            "    generic nanohub page -> link:1\n"
-            "  For each unique nanoHUB URL found, call add_nanohub_resource.\n"
+            "    resources/tools URL   -> resource:<id>\n"
+            "    publications URL      -> publication:<id>\n"
+            "    generic nanohub page  -> link:1\n"
+            "    any chipshub.org page -> link:2\n"
+            "  For each unique nanoHUB or ChipsHub URL found, call add_nanohub_resource.\n"
             "  Do this regardless of whether affiliated is 0 or 1.\n\n"
             "=== WORKFLOW ===\n"
             "1. Call get_citation_details.\n"
@@ -1167,9 +1365,10 @@ class ClassificationAgent(BaseCitationAgent):
             {
                 "name": "add_nanohub_resource",
                 "description": (
-                    "Register a nanoHUB association found in the PDF as an association on this citation. "
+                    "Register a nanoHUB or ChipsHub association found in the PDF as an association on this citation. "
                     "Mapping rules: resources/tools URL -> resource:<id>, "
-                    "publications URL -> publication:<id>, generic nanohub page -> link:1. "
+                    "publications URL -> publication:<id>, generic nanohub page -> link:1, "
+                    "any chipshub.org page -> link:2. "
                     "Pass full URL (preferred) or numeric resource ID."
                 ),
                 "input_schema": {
@@ -1178,7 +1377,7 @@ class ClassificationAgent(BaseCitationAgent):
                         "citation_id": {"type": "integer"},
                         "resource_url": {
                             "type": "string",
-                            "description": "Full nanoHUB URL or numeric resource ID.",
+                            "description": "Full nanoHUB/ChipsHub URL or numeric resource ID.",
                         },
                     },
                     "required": ["citation_id", "resource_url"],
@@ -1312,6 +1511,28 @@ class ClassificationAgent(BaseCitationAgent):
                             f"Set affiliated=1. Evidence: {evidence_line}"
                         )
 
+                    # NCN researcher name affiliation: set affiliated=1 if a known NCN researcher is an author.
+                    if citation.affiliated != 1:
+                        matched_ncn_authors = []
+                        for author in (citation.authors or []):
+                            if not isinstance(author, dict):
+                                continue
+                            fn = (author.get("firstname") or author.get("firstName") or "").strip().lower()
+                            ln = (author.get("lastname") or author.get("lastName") or "").strip().lower()
+                            full = f"{fn} {ln}".strip()
+                            if full in _NCN_RESEARCHER_NAMES:
+                                matched_ncn_authors.append(f"{fn} {ln}")
+                        if matched_ncn_authors:
+                            citation.affiliated = 1
+                            changed = True
+                            existing = citation.notes or ""
+                            sep = "\n" if existing else ""
+                            citation.notes = (
+                                f"{existing}{sep}[Agent/{self.STAGE_NAME}] "
+                                f"[NCN_STRICT_EVIDENCE] Known NCN researcher(s) detected as author(s): "
+                                f"{', '.join(matched_ncn_authors)}. Set affiliated=1."
+                            )
+
                     if changed:
                         self.cit_client.update(citation)
                         print(f"    [dates] saved {dates_saved}")
@@ -1320,9 +1541,41 @@ class ClassificationAgent(BaseCitationAgent):
                 except Exception as exc:
                     print(f"    [dates] error saving: {exc}")
 
+                # ── Surface author affiliation block ───────────────────────
+                # Affiliations are often in an "AUTHOR INFORMATION" / "Author
+                # contributions" section near the end of the PDF, far beyond the
+                # 12 000-char tool-result truncation limit.  Extract it and
+                # prepend it so the LLM always sees it regardless of paper length.
+                import re as _re_pdf
+                _AFFIL_HEADERS = [
+                    r"AUTHOR\s+INFORMATION",
+                    r"Author\s+Information",
+                    r"AUTHORS?\s+CONTRIBUTIONS?",
+                    r"AFFILIATIONS?",
+                    r"Affiliations?",
+                    r"Corresponding\s+Author",
+                    r"Author\s+details",
+                ]
+                affil_snippet = ""
+                for _pat in _AFFIL_HEADERS:
+                    _m = _re_pdf.search(_pat, text)
+                    if _m:
+                        affil_raw = text[_m.start(): _m.start() + 2000]
+                        affil_snippet = _clean_text(affil_raw)
+                        break
+
+                display_text = clean
+                if affil_snippet and affil_snippet not in clean[:2000]:
+                    display_text = (
+                        "=== AUTHOR AFFILIATION BLOCK (extracted from end of PDF) ===\n"
+                        + affil_snippet
+                        + "\n=== FULL PDF TEXT ===\n"
+                        + clean
+                    )
+
                 return {
                     "ok": True,
-                    "text": clean,
+                    "text": display_text,
                     "total_pages": len(reader.pages),
                     "nanohub_associations_registered": registered,
                     "nanohub_evidence_found": bool(nanohub_evidence.get("found")),
@@ -1331,7 +1584,7 @@ class ClassificationAgent(BaseCitationAgent):
                     "ncn_strict_evidence_matches": ncn_strict_evidence.get("matches", []),
                     "dates_saved": dates_saved,
                     "bibliographic_saved": bib_saved,
-                    "note": "nanoHUB associations and dates have already been registered — do not call add_nanohub_resource again for these URLs.",
+                    "note": "nanoHUB and ChipsHub associations and dates have already been registered — do not call add_nanohub_resource again for these URLs.",
                 }
             except Exception as exc:
                 return {"ok": False, "error": str(exc)}
@@ -1350,6 +1603,10 @@ class ClassificationAgent(BaseCitationAgent):
                 candidate_urls: List[str] = []
                 if citation.url and citation.url.strip():
                     candidate_urls.append(citation.url.strip())
+
+                # Always include the DOI URL so Crossref/publisher pages are fetched
+                if citation.doi and citation.doi.strip():
+                    candidate_urls.append(f"https://doi.org/{citation.doi.strip()}")
 
                 for blob in [citation.notes or "", citation.abstract or ""]:
                     for u in _URL_RE.findall(blob):
@@ -1468,7 +1725,10 @@ class ClassificationAgent(BaseCitationAgent):
                 doi_saved = None
                 publication_saved = None
                 authors_updated = 0
-                if detected_date and not citation.date_publish:
+                _INVALID_DATES = {"0000-00-00", "0000-00", "0000", "00-00-0000", ""}
+                existing_date = (citation.date_publish or "").strip()
+                existing_date_ok = existing_date and existing_date not in _INVALID_DATES and not re.match(r"^0+[-/0]*$", existing_date)
+                if detected_date and not existing_date_ok:
                     citation.date_publish = detected_date
                     date_saved = detected_date
                     changed = True
@@ -1542,6 +1802,13 @@ class ClassificationAgent(BaseCitationAgent):
                         citation.affiliated = int(value)
                         updated.append("affiliated")
                     elif hasattr(citation, key):
+                        # Reject sentinel/zero dates before writing to the DB.
+                        if key == "date_publish" and isinstance(value, str):
+                            _INVALID_DATES = {"0000-00-00", "0000-00", "0000", "00-00-0000", ""}
+                            v = value.strip()
+                            if v in _INVALID_DATES or re.match(r"^0+[-/0]*$", v):
+                                updated.append("date_publish_rejected_sentinel")
+                                continue
                         setattr(citation, key, _clean_text(value) if isinstance(value, str) else value)
                         updated.append(key)
 
@@ -1564,60 +1831,171 @@ class ClassificationAgent(BaseCitationAgent):
             try:
                 citation = self.cit_client.get(cid)
 
-                # ── Step 1: deduplicate existing DB author records ──────────
-                # The PHP API appends rather than replaces, so prior failed runs
-                # may leave stale N/A duplicate entries. Group by sig and keep
-                # only the best record per author; remove the rest.
-                by_sig: Dict[str, List[Dict]] = {}
-                for existing in citation.authors:
-                    fn = (existing.get("firstname") or "").lower()
-                    ln = (existing.get("lastname") or "").lower()
-                    sig = f"{ln}_{fn[:1]}"
-                    by_sig.setdefault(sig, []).append(existing)
+                # ── Author identity helpers ─────────────────────────────────
+                _PLACEHOLDER_NAMES_SET = {"n/a", "placeholder", "unknown", "author", ""}
+
+                def _same_person(fn_a: str, ln_a: str, fn_b: str, ln_b: str) -> bool:
+                    """True if two name pairs likely refer to the same person.
+
+                    Handles:
+                      - Exact match:        "John Smith"  == "John Smith"
+                      - Single initial:     "J. Smith"    == "John Smith"
+                      - First-name prefix:  "Ha Lee"      == "Ha Young Lee"
+                                            "Kenneth Crozier" == "Kenneth B. Crozier"
+                        (shorter fn is a complete word-boundary prefix of the longer)
+                    Does NOT conflate "James Smith" with "John Smith".
+                    """
+                    if ln_a.lower() != ln_b.lower():
+                        return False
+                    fa = fn_a.lower().rstrip(".")
+                    fb = fn_b.lower().rstrip(".")
+                    if fa == fb:
+                        return True
+                    short, long = (fa, fb) if len(fa) <= len(fb) else (fb, fa)
+                    # Single-initial abbreviation: "j" matches "john"
+                    if len(short) == 1 and long.startswith(short):
+                        return True
+                    # First-name prefix: "ha" matches "ha young" only at a word boundary
+                    if long.startswith(short + " "):
+                        return True
+                    return False
+
+                def _author_richness(a: Dict) -> int:
+                    score = len((a.get("firstname") or "").strip())
+                    for fld in ("organizationname", "organizationdept", "email", "orcid", "countryresident"):
+                        if (a.get(fld) or "").strip().upper() not in ("", "N/A"):
+                            score += 10
+                    return score
 
                 def _has_real_org(a: Dict) -> bool:
                     org = (a.get("organization_name") or a.get("organizationname") or "")
                     return bool(org) and org.upper() != "N/A"
 
-                existing_by_sig: Dict[str, Dict] = {}
-                for sig, entries in by_sig.items():
-                    if len(entries) == 1:
-                        existing_by_sig[sig] = entries[0]
-                    else:
-                        # Keep the entry with real org data; remove the rest
-                        real = [e for e in entries if _has_real_org(e)]
-                        keep = real[0] if real else entries[-1]
-                        existing_by_sig[sig] = keep
-                        for stale in entries:
-                            if stale is keep:
-                                continue
-                            stale_id = stale.get("id")
-                            if stale_id:
-                                try:
-                                    self.cit_client._api_call(
-                                        "PersonDocument",
-                                        {"action": "remove", "idDocument": cid, "idPerson": stale_id},
-                                    )
-                                except Exception:
-                                    pass  # best-effort removal
+                # ── Step 1: deduplicate existing DB author records ──────────
+                # Cluster existing records by identity (same-person check).
+                # The PHP API appends rather than replaces, so prior failed runs
+                # may leave stale / abbreviated duplicate entries.
+                valid_existing = []
+                for existing in citation.authors:
+                    fn = (existing.get("firstname") or "").strip()
+                    ln = (existing.get("lastname") or "").strip()
+                    if not fn or not ln:
+                        continue
+                    if fn.lower() in _PLACEHOLDER_NAMES_SET or ln.lower() in _PLACEHOLDER_NAMES_SET:
+                        continue
+                    valid_existing.append(existing)
+
+                # Build clusters: each cluster = list of records for the same person
+                clusters: List[List[Dict]] = []
+                for rec in valid_existing:
+                    fn_r = (rec.get("firstname") or "").strip()
+                    ln_r = (rec.get("lastname") or "").strip()
+                    placed = False
+                    for cluster in clusters:
+                        rep = cluster[0]
+                        fn_c = (rep.get("firstname") or "").strip()
+                        ln_c = (rep.get("lastname") or "").strip()
+                        if _same_person(fn_r, ln_r, fn_c, ln_c):
+                            cluster.append(rec)
+                            placed = True
+                            break
+                    if not placed:
+                        clusters.append([rec])
+
+                existing_by_fullsig: Dict[str, Dict] = {}
+                for cluster in clusters:
+                    keep = max(cluster, key=_author_richness)
+                    # Index by every variant sig in the cluster for lookup
+                    for rec in cluster:
+                        fn = (rec.get("firstname") or "").strip().lower()
+                        ln = (rec.get("lastname") or "").strip().lower()
+                        existing_by_fullsig[f"{ln}_{fn}"] = keep
+                    # Remove stale duplicates from DB
+                    for stale in cluster:
+                        if stale is keep:
+                            continue
+                        stale_id = stale.get("id")
+                        if stale_id:
+                            try:
+                                self.cit_client._api_call(
+                                    "PersonDocument",
+                                    {"action": "remove", "idDocument": cid, "idPerson": stale_id},
+                                )
+                            except Exception:
+                                pass
 
                 # ── Step 2: build enriched author list ─────────────────────
+                def _fix_pdf_name_spacing(name: str) -> str:
+                    """
+                    Repair common PDF extraction artefacts in author names:
+                      - Collapsed spaces inside all-caps tokens from ligature breaks
+                        e.g. "GEZG IN" → "GEZGIN", "Ha mdi" → "Hamdi"
+                      - Keeps legitimate spaces between words (e.g. "van der Berg")
+                    Strategy: if a word is all-uppercase and the next word is also all-uppercase,
+                    join them (they were one word split by ligature/column break).
+                    """
+                    import re as _re
+                    # Collapse sequences of ALL-CAPS tokens that were split mid-word
+                    # e.g. "GUNDO GDU" → "GUNDOGDU", "Ha mdi" → "Hamdi" (mixed case single break)
+                    def _join_broken_caps(s: str) -> str:
+                        tokens = s.split()
+                        if len(tokens) <= 1:
+                            return s
+                        merged = [tokens[0]]
+                        for tok in tokens[1:]:
+                            prev = merged[-1]
+                            # Join if previous token is all-caps (or titlecase continuation)
+                            # and current token is all-caps and short (likely a fragment)
+                            prev_caps = prev == prev.upper() and prev.isalpha()
+                            tok_caps  = tok  == tok.upper()  and tok.isalpha()
+                            if prev_caps and tok_caps:
+                                merged[-1] = prev + tok
+                            else:
+                                merged.append(tok)
+                        return " ".join(merged)
+                    return _join_broken_caps(name.strip())
+
+                def _split_fullname(firstname: str, lastname: str):
+                    """
+                    If the LLM put the full name into firstname and left lastname empty,
+                    split on the last space: first N-1 words → firstname, last word → lastname.
+                    Also repairs PDF spacing artefacts in both parts.
+                    """
+                    fn = _fix_pdf_name_spacing(firstname.strip())
+                    ln = _fix_pdf_name_spacing(lastname.strip())
+                    if ln:
+                        return fn, ln
+                    # lastname is empty — treat firstname as full name
+                    parts = fn.split()
+                    if len(parts) >= 2:
+                        return " ".join(parts[:-1]), parts[-1]
+                    return fn, ln  # only one token, can't split
+
                 def _build_clean_authors(include_person_ids: bool) -> List[Dict]:
                     clean: List[Dict] = []
-                    seen: set = set()
+                    # Track already-added authors to skip duplicates in the incoming list
+                    added: List[tuple] = []  # list of (fn, ln) already added
+                    print(f"    [update_authors] building {len(raw_authors)} incoming author(s), include_ids={include_person_ids}")
                     for a in raw_authors:
-                        fn = _ascii(a.get("firstname", ""))
-                        ln = _ascii(a.get("lastname", ""))
+                        raw_fn = a.get("firstname", "")
+                        raw_ln = a.get("lastname", "")
+                        fn_split, ln_split = _split_fullname(raw_fn, raw_ln)
+                        fn = _ascii(fn_split)
+                        ln = _ascii(ln_split)
                         if not fn or not ln:
                             # Backend enforces both first/last names for Person records.
+                            print(f"    [update_authors] SKIP (missing name): fn={fn!r} ln={ln!r} (raw: fn={raw_fn!r} ln={raw_ln!r})")
                             continue
-                        sig = f"{ln.lower()}_{fn[:1].lower()}"
-                        if sig in seen:
+                        # Skip if this incoming author is the same person as one already added
+                        dup_match = [(af, al) for af, al in added if _same_person(fn, ln, af, al)]
+                        if dup_match:
+                            print(f"    [update_authors] SKIP (duplicate of {dup_match[0]}): fn={fn!r} ln={ln!r}")
                             continue
-                        seen.add(sig)
+                        added.append((fn, ln))
+                        print(f"    [update_authors] KEEP: fn={fn!r} ln={ln!r}")
 
-                        # Start from deduplicated existing author record.
-                        base = dict(existing_by_sig.get(sig, {}))
+                        # Look up existing DB record for this person
+                        base = dict(existing_by_fullsig.get(f"{ln.lower()}_{fn.lower()}", {}) or {})
                         if not include_person_ids:
                             # Preferred path: omit person IDs so backend writes
                             # person-document detail fields from this payload.
@@ -1651,7 +2029,41 @@ class ClassificationAgent(BaseCitationAgent):
                                 is_ascii_field = field not in ("orcid", "scopusid", "researcherid", "gsid", "researchgateid", "countryresident")
                                 base[api_key] = _ascii(val) if is_ascii_field else str(val).strip()
 
+                        # Normalise and infer organizationtype.
+                        # First map LLM free-text variants to canonical values,
+                        # then fall back to inference from the org name.
+                        _VALID_ORG_TYPES = {"Education", "Research", "Government", "Military", "Industry"}
+                        _ORG_TYPE_ALIASES = {
+                            # Education variants
+                            "university": "Education", "college": "Education",
+                            "school": "Education", "academic": "Education",
+                            "academia": "Education", "educational": "Education",
+                            # Research variants
+                            "research": "Research", "research institute": "Research",
+                            "laboratory": "Research", "lab": "Research",
+                            # Government variants
+                            "government": "Government", "federal": "Government",
+                            "national lab": "Government", "national laboratory": "Government",
+                            # Military variants
+                            "military": "Military", "defence": "Military", "defense": "Military",
+                            # Industry variants
+                            "industry": "Industry", "company": "Industry",
+                            "corporate": "Industry", "private": "Industry",
+                        }
+                        org_name = base.get("organizationname", "")
+                        org_type = (base.get("organizationtype") or "").strip()
+                        if org_type not in _VALID_ORG_TYPES:
+                            # Invalid or missing type: always infer from org name
+                            # when available (most accurate), otherwise map alias.
+                            if org_name:
+                                base["organizationtype"] = _infer_org_type(org_name)
+                            else:
+                                canonical = _ORG_TYPE_ALIASES.get(org_type.lower())
+                                if canonical:
+                                    base["organizationtype"] = canonical
+
                         clean.append(base)
+                    print(f"    [update_authors] result: {len(clean)} author(s) in final list")
                     return clean
 
                 # First pass: no person IDs (best chance to persist org fields).
@@ -1759,18 +2171,38 @@ class ClassificationAgent(BaseCitationAgent):
     # Prompt builder
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _is_placeholder_author(a: Dict) -> bool:
+        _PLACEHOLDER_NAMES = {"n/a", "placeholder", "unknown", "author", ""}
+        fn = (a.get("firstname") or "").lower().strip()
+        ln = (a.get("lastname") or "").lower().strip()
+        return fn in _PLACEHOLDER_NAMES or ln in _PLACEHOLDER_NAMES
+
     def _build_prompt(self, citation) -> str:
+        all_authors = citation.authors or []
+        real_authors = [a for a in all_authors if not self._is_placeholder_author(a)]
+        placeholder_count = len(all_authors) - len(real_authors)
+
         author_orgs = [
             a.get("organization_name", a.get("organizationname", "N/A"))
-            for a in (citation.authors or [])
+            for a in real_authors
         ]
         orgs_summary = ", ".join(set(author_orgs)) or "(none)"
+
+        if placeholder_count > 0:
+            authors_line = (
+                f"{len(real_authors)} real + {placeholder_count} PLACEHOLDER "
+                f"(orgs: {orgs_summary[:80]}) — PLACEHOLDER authors must be replaced with real names from the PDF"
+            )
+        else:
+            authors_line = f"{len(real_authors)} (orgs: {orgs_summary[:80]})"
+
         return (
             f"Please classify citation ID {citation.id}.\n\n"
             f"Current state:\n"
             f"  Title        : {citation.title or '(missing)'}\n"
             f"  Year         : {citation.year or '(missing)'}\n"
-            f"  Authors      : {len(citation.authors or [])} (orgs: {orgs_summary[:80]})\n"
+            f"  Authors      : {authors_line}\n"
             f"  Abstract     : {'present' if citation.abstract else '(MISSING)'}\n"
             f"  Genre        : {citation.document_genre_name or '(missing)'}\n"
             f"  ref_type     : {citation.ref_type or '(MISSING)'}\n"
@@ -1799,7 +2231,12 @@ class ClassificationAgent(BaseCitationAgent):
         elif not title_result.get("ok"):
             print(f"  [classification] title validation warning: {title_result.get('error')}")
 
-        # Reload after potential title update
+        # Remove placeholder/unnamed author records before the LLM loop
+        prune_result = self._prune_invalid_existing_authors(citation_id)
+        if prune_result.get("removed_ids"):
+            print(f"  [classification] pruned placeholder authors: {prune_result['removed_ids']}")
+
+        # Reload after potential title update and author pruning
         citation = self.cit_client.get(citation_id)
         user_message = self._build_prompt(citation)
         result_text = self._run_agentic_loop(user_message)

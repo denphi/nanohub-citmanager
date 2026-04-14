@@ -9,6 +9,10 @@ through a five-stage workflow:
   Status 3 → ClassificationAgent   — Field completeness check
   Status 4 → ReviewAgent           — Experimentalist & Experimental Data review
   Status 5 → HumanReviewAgent      — Prepare summary for human review
+
+Post-review quality gate (explicit, not auto-chained):
+  ValidationAgent  — checks all required fields + abstract quality;
+                     passes (stays 5) or fails (moves back to 3)
 """
 
 from .base_agent import BaseCitationAgent, AgentResult
@@ -17,7 +21,8 @@ from .status2_disambiguation import DisambiguationAgent
 from .status3_classification import ClassificationAgent
 from .status4_review import ReviewAgent
 from .status5_human_review import HumanReviewAgent
-from .orchestrator import CitationPipelineOrchestrator, STATUS_LABELS
+from .status5_validation import ValidationAgent
+from .orchestrator import CitationPipelineOrchestrator, STATUS_LABELS, VALIDATION_STAGE
 
 __all__ = [
     "BaseCitationAgent",
@@ -27,6 +32,8 @@ __all__ = [
     "ClassificationAgent",
     "ReviewAgent",
     "HumanReviewAgent",
+    "ValidationAgent",
     "CitationPipelineOrchestrator",
     "STATUS_LABELS",
+    "VALIDATION_STAGE",
 ]

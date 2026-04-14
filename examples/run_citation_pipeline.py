@@ -10,6 +10,10 @@ Process one citation (or a batch) through the five-stage automated pipeline:
   Status 4 — Dual Review (Experimentalist? / Experimental Data?)
   Status 5 — Human Review Package Preparation
 
+Post-review validation (explicit quality gate):
+  --validate    — Run the ValidationAgent on status-5 citations.
+                  PASS → stays at 5.  FAIL → moved back to 3 for re-classification.
+
 Usage examples
 --------------
 # Process a single citation from wherever it currently is:
@@ -32,6 +36,12 @@ Usage examples
 
 # Dry-run: list matching citations without processing:
   python run_citation_pipeline.py --status 3 --limit 20 --dry-run
+
+# Validate a single status-5 citation:
+  python run_citation_pipeline.py --id 1234 --validate
+
+# Validate all status-5 citations (batch, limit 20):
+  python run_citation_pipeline.py --validate --limit 20
 """
 
 import os
@@ -96,6 +106,18 @@ def _parse_args():
         help="Batch filter: citations from the given publication year.",
     )
 
+    # Validation mode
+    parser.add_argument(
+        "--validate",
+        action="store_true",
+        help=(
+            "Run the post-review ValidationAgent instead of the normal pipeline. "
+            "PASS → citation stays at status 5. "
+            "FAIL → citation moved back to status 3 for re-classification. "
+            "Requires --id (single) or no --id (batch over all status-5 citations)."
+        ),
+    )
+
     # Pipeline control
     parser.add_argument(
         "--single-stage",
@@ -143,6 +165,41 @@ def _parse_args():
 
 def main():
     args = _parse_args()
+
+    # ── Validation mode ──────────────────────────────────────────────
+    if args.validate:
+        print("=" * 60)
+        print("  CITATION VALIDATION")
+        print("=" * 60)
+        client = _build_client()
+        orchestrator = CitationPipelineOrchestrator(client)
+
+        if args.id is not None:
+            # Single citation
+            print(f"\n  Validating citation {args.id}…")
+            result = orchestrator.validate_citation(args.id)
+            print(f"\n  Result: {'PASSED' if result.success else 'FAILED'}")
+            print(f"  Status : {result.status_before} → {result.status_after}")
+            print(f"  Message: {result.message}")
+            if result.details.get("failures"):
+                print("  Issues :")
+                for f in result.details["failures"]:
+                    print(f"    - {f}")
+        else:
+            # Batch over all status-5 citations
+            results = orchestrator.validate_citations(
+                limit=args.limit,
+                offset=args.offset,
+                continue_on_failure=args.continue_on_failure,
+            )
+            passed = sum(1 for r in results if r.success)
+            failed = len(results) - passed
+            print("\n" + "=" * 60)
+            print("  VALIDATION COMPLETE")
+            print(f"  Passed (stay at 5) : {passed}")
+            print(f"  Failed (→ status 3): {failed}")
+            print("=" * 60)
+        return
 
     if args.id is None and args.status is None and args.year is None:
         print("Error: specify either --id for single citation, or batch filters (--status and/or --year).")
@@ -247,6 +304,11 @@ def main():
                 success_count += 1
             else:
                 fail_count += 1
+                # Stop immediately on 429 regardless of --continue-on-failure
+                last_msg = report.stages_run[-1].message if report.stages_run else ""
+                if "429" in last_msg or "rate limit" in last_msg.lower():
+                    print("  Stopping batch: 429 rate limit reached.")
+                    break
                 if not args.continue_on_failure:
                     print("  Stopping batch due to failure (use --continue-on-failure to skip).")
                     break

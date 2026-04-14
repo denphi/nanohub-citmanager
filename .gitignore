@@ -54,6 +54,8 @@ htmlcov/
 *.tmp
 *.bak
 *.pdf
+*.png
+*.svg
 citation_*.pdf
 downloaded_*.pdf
 

@@ -1,7 +1,7 @@
 """
 Citation Pipeline Orchestrator
 
-Chains the five pipeline agents together and processes one citation at a time.
+Chains the pipeline agents together and processes one citation at a time.
 Determines which agent(s) to run based on the citation's current status.
 
 Status map:
@@ -10,6 +10,10 @@ Status map:
   3 → ClassificationAgent   → advances to 4
   4 → ReviewAgent           → advances to 5
   5 → HumanReviewAgent      → stays at 5 (human decides publish/reject)
+
+Post-review validation (explicit, not auto-chained from status 5):
+  ValidationAgent           → runs on status-5 citations; passes (stays 5)
+                              or fails (moves back to 3 for re-classification)
 """
 
 from dataclasses import dataclass, field
@@ -23,6 +27,7 @@ from .status2_disambiguation import DisambiguationAgent
 from .status3_classification import ClassificationAgent
 from .status4_review import ReviewAgent
 from .status5_human_review import HumanReviewAgent
+from .status5_validation import ValidationAgent
 
 
 # Status labels for display
@@ -35,6 +40,9 @@ STATUS_LABELS: Dict[int, str] = {
     100: "Published",
     -9: "Junk / Deleted",
 }
+
+# Validation is a separate post-review pass, not a numbered pipeline status.
+VALIDATION_STAGE = "validation"
 
 
 @dataclass
@@ -94,6 +102,7 @@ class CitationPipelineOrchestrator:
             4: ReviewAgent(cit_client),
             5: HumanReviewAgent(cit_client),
         }
+        self._validation_agent = ValidationAgent(cit_client)
         # Show backend once after all agents are initialised
         backend = self._agents[1]._backend
         model = (
@@ -144,13 +153,21 @@ class CitationPipelineOrchestrator:
             if current_status == 5:
                 break
 
-            if not result.success and stop_on_failure:
-                print(
-                    f"  Stage blocked at status {current_status} "
-                    f"({STATUS_LABELS.get(current_status, '')}). "
-                    "Stopping pipeline."
-                )
-                break
+            if not result.success:
+                msg_lower = (result.message or "").lower()
+                if "429" in result.message or "rate limit" in msg_lower:
+                    print(
+                        f"  Stopping pipeline: 429 rate limit reached at status "
+                        f"{current_status} ({STATUS_LABELS.get(current_status, '')})."
+                    )
+                    break
+                if stop_on_failure:
+                    print(
+                        f"  Stage blocked at status {current_status} "
+                        f"({STATUS_LABELS.get(current_status, '')}). "
+                        "Stopping pipeline."
+                    )
+                    break
 
             if not run_full_pipeline:
                 break
@@ -226,3 +243,60 @@ class CitationPipelineOrchestrator:
     ) -> List[Dict]:
         """Backward-compatible wrapper for status-only listing."""
         return self.list_citations(status=status, limit=limit, offset=offset)
+
+    # ------------------------------------------------------------------
+    # Post-review validation
+    # ------------------------------------------------------------------
+
+    def validate_citation(self, citation_id: int) -> AgentResult:
+        """
+        Run the post-review validation gate on a single status-5 citation.
+
+        PASS  → citation stays at status 5, [VALIDATION_PASSED] note appended.
+        FAIL  → citation moved back to status 3, [VALIDATION_FAILED] note
+                with all failure reasons appended.
+
+        The citation does not need to be at status 5 — the agent runs
+        regardless and checks the actual field values.
+        """
+        return self._validation_agent.run(citation_id)
+
+    def validate_citations(
+        self,
+        limit: int = 10,
+        offset: int = 0,
+        continue_on_failure: bool = True,
+    ) -> List[AgentResult]:
+        """
+        Run the validation gate on all current status-5 citations (batch).
+
+        Returns a list of AgentResult, one per citation processed.
+        Citations that fail validation are moved back to status 3.
+        """
+        docs = self.list_citations(status=5, limit=limit, offset=offset)
+        results: List[AgentResult] = []
+
+        print(f"\n  Validation batch: {len(docs)} status-5 citation(s)")
+        for i, doc in enumerate(docs, 1):
+            cid = doc.get("id")
+            print(f"\n[{i}/{len(docs)}] Validating citation {cid}…")
+            try:
+                result = self._validation_agent.run(cid)
+                results.append(result)
+                if not result.success:
+                    msg_lower = (result.message or "").lower()
+                    if "429" in result.message or "rate limit" in msg_lower:
+                        print("  Stopping batch: 429 rate limit reached.")
+                        break
+                    if not continue_on_failure:
+                        print("  Stopping batch (use continue_on_failure=True to skip).")
+                        break
+            except Exception as exc:
+                print(f"  ERROR validating citation {cid}: {exc}")
+                if not continue_on_failure:
+                    break
+
+        passed = sum(1 for r in results if r.success)
+        failed = len(results) - passed
+        print(f"\n  Validation complete — passed: {passed}  failed (→ status 3): {failed}")
+        return results

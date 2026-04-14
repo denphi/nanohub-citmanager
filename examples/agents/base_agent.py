@@ -13,6 +13,7 @@ import json
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -67,13 +68,13 @@ def _make_anthropic_client():
     return anthropic.Anthropic()
 
 
-def _make_openai_client():
+def _make_openai_client(timeout: float = 60.0):
     from openai import OpenAI
     url = os.getenv("OPENWEBUI_URL", "https://genai.rcac.purdue.edu/api/chat/completions")
     # The openai SDK appends /chat/completions automatically — strip it if present
     if url.endswith("/chat/completions"):
         url = url[: -len("/chat/completions")]
-    return OpenAI(base_url=url, api_key=os.getenv("OPENWEBUI_KEY"))
+    return OpenAI(base_url=url, api_key=os.getenv("OPENWEBUI_KEY"), timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +134,11 @@ class BaseCitationAgent:
     TOOL_RESULT_MAX_LIST_ITEMS: int = 200
     TOOL_RESULT_MAX_DICT_ITEMS: int = 200
     RETRY_COMPACT_KEEP_MESSAGES: int = 8
+    # Per-request timeout (seconds) for the OpenAI-compatible backend.
+    # 504s from nginx arrive quickly; keeping this short avoids long hangs.
+    OPENAI_REQUEST_TIMEOUT: float = 60.0
+    # Seconds to wait before retrying after a 429 rate-limit response.
+    OPENAI_RATE_LIMIT_WAIT: float = 30.0
 
     def __init__(self, cit_client: CitationManagerClient):
         self.cit_client = cit_client
@@ -140,7 +146,7 @@ class BaseCitationAgent:
         self._llm_client = (
             _make_anthropic_client()
             if self._backend == "anthropic"
-            else _make_openai_client()
+            else _make_openai_client(timeout=self.OPENAI_REQUEST_TIMEOUT)
         )
         self._openai_model = (
             self.OPENAI_MODEL
@@ -306,6 +312,32 @@ class BaseCitationAgent:
     # OpenAI-compatible loop (OpenWebUI / Purdue GenAI)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _is_rate_limit_error(exc: Exception) -> bool:
+        """Return True if the exception looks like a 429 / rate-limit response."""
+        msg = str(exc).lower()
+        return (
+            "429" in msg
+            or "rate limit" in msg
+            or "rate_limit" in msg
+            or "too many requests" in msg
+            or "quota" in msg
+        )
+
+    def _openai_create(self, messages: List[Dict], tools: List[Dict]) -> Any:
+        """
+        Single attempt at chat.completions.create with timeout.
+        Raises on rate-limit so the caller can back off and retry.
+        Re-raises all other exceptions unchanged.
+        """
+        return self._llm_client.chat.completions.create(
+            model=self._openai_model,
+            messages=messages,
+            tools=tools,
+            tool_choice="auto",
+            timeout=self.OPENAI_REQUEST_TIMEOUT,
+        )
+
     def _run_openai_loop(self, user_message: str) -> str:
         messages: List[Dict] = [
             {"role": "system", "content": self._system_prompt},
@@ -313,37 +345,45 @@ class BaseCitationAgent:
         ]
         tools = _to_openai_tools(self._tool_definitions())
 
+        # Repetition guard: track last N (tool_name, arguments) pairs to detect spin loops
+        _recent_calls: list = []
+        _REPEAT_LIMIT = 3  # abort if same call appears 3 times in a row
+
         for _ in range(self.MAX_ITERATIONS):
             response = None
             for attempt in range(3):
                 try:
-                    response = self._llm_client.chat.completions.create(
-                        model=self._openai_model,
-                        messages=messages,
-                        tools=tools,
-                        tool_choice="auto",
-                    )
+                    response = self._openai_create(messages, tools)
                     if response is not None and getattr(response, "choices", None):
                         break
                     response = None
                     print(f"    [openai] null response, retrying (attempt {attempt + 1}/3)...")
                 except Exception as exc:
-                    print(f"    [openai] request error: {exc}, retrying (attempt {attempt + 1}/3)...")
+                    if self._is_rate_limit_error(exc):
+                        print(
+                            f"    [openai] 429 rate limit — waiting {self.OPENAI_RATE_LIMIT_WAIT}s "
+                            f"before retry (attempt {attempt + 1}/3)..."
+                        )
+                        time.sleep(self.OPENAI_RATE_LIMIT_WAIT)
+                    else:
+                        print(f"    [openai] request error: {exc}, retrying (attempt {attempt + 1}/3)...")
             if response is None:
                 # Recovery path: compact context and try once more.
                 print("    [openai] retrying with compacted context...")
                 compacted = self._compact_messages_for_retry(messages)
                 try:
-                    response = self._llm_client.chat.completions.create(
-                        model=self._openai_model,
-                        messages=compacted,
-                        tools=tools,
-                        tool_choice="auto",
-                    )
+                    response = self._openai_create(compacted, tools)
                     if response is not None and getattr(response, "choices", None):
                         messages = compacted
                 except Exception as exc:
-                    print(f"    [openai] compact-retry error: {exc}")
+                    if self._is_rate_limit_error(exc):
+                        print(
+                            f"    [openai] 429 rate limit on compact-retry — "
+                            f"waiting {self.OPENAI_RATE_LIMIT_WAIT}s..."
+                        )
+                        time.sleep(self.OPENAI_RATE_LIMIT_WAIT)
+                    else:
+                        print(f"    [openai] compact-retry error: {exc}")
                     response = None
             if response is None:
                 return "Error: LLM returned no response after retries (including compact-retry)."
@@ -377,6 +417,15 @@ class BaseCitationAgent:
                         input_data = json.loads(tc.function.arguments)
                     except json.JSONDecodeError:
                         input_data = {}
+
+                    # Repetition guard: detect spin loops
+                    call_sig = (name, tc.function.arguments)
+                    _recent_calls.append(call_sig)
+                    if len(_recent_calls) > _REPEAT_LIMIT:
+                        _recent_calls.pop(0)
+                    if len(_recent_calls) == _REPEAT_LIMIT and len(set(_recent_calls)) == 1:
+                        print(f"    [openai] loop detected — {name} called {_REPEAT_LIMIT}x with same args, stopping.")
+                        return f"Loop detected: {name} repeated {_REPEAT_LIMIT} times without progress."
 
                     print(f"    → {name}({json.dumps(input_data)[:120]})")
                     try:

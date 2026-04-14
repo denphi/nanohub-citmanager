@@ -235,7 +235,7 @@ def _clean_field_text(text: str, max_chars: int = 12000) -> str:
 
 def _detect_nanohub_evidence(citation) -> Dict[str, Any]:
     """
-    Detect explicit nanoHUB/NCN evidence from citation text fields.
+    Detect explicit nanoHUB/NCN/ChipsHub evidence from citation text fields.
     Returns {'found': bool, 'matches': [..]}.
     """
     blobs = [
@@ -250,6 +250,8 @@ def _detect_nanohub_evidence(citation) -> Dict[str, Any]:
         r"\bnano[-\s]?hub\b",
         r"\bnetwork for computational nanotechnology\b",
         r"\bncn\b",
+        r"\bchipshub\b",
+        r"\bchips[-\s]?hub\b",
     ]
     matches: List[str] = []
     for field, text in blobs:
@@ -284,6 +286,9 @@ def _detect_nanohub_evidence_in_pdf(cit_client, citation_id: int) -> Dict[str, A
             r"\bnetwork for computational nanotechnology\b",
             r"\bncn\b",
             r"\bnanohub\.org\b",
+            r"\bchipshub\b",
+            r"\bchips[-\s]?hub\b",
+            r"\bchipshub\.org\b",
         ]
         matches: List[str] = []
         for p in patterns:
@@ -360,6 +365,13 @@ def _build_association_context(citation) -> Dict[str, Any]:
                 "url": u,
                 "explanation": "Generic nanoHUB page citation (mapped as link:1).",
             })
+        elif "chipshub.org/" in lu:
+            parsed.append({
+                "type": "link",
+                "id_or_alias": "2",
+                "url": u,
+                "explanation": "ChipsHub page citation (mapped as link:2).",
+            })
         elif "/doi/" in lu or "doi.org/" in lu:
             parsed.append({
                 "type": "evidence_url",
@@ -386,6 +398,10 @@ class HumanReviewAgent(BaseCitationAgent):
     TARGET_STATUS = 5
     # No automatic advancement — human decides
     NEXT_STATUS = 5
+
+    # Keep context small — OpenWebUI model returns null on large payloads
+    TOOL_RESULT_MAX_STRING_CHARS: int = 4000
+    TOOL_RESULT_MAX_JSON_CHARS: int = 12000
 
     # ------------------------------------------------------------------
     # System prompt
@@ -416,16 +432,18 @@ class HumanReviewAgent(BaseCitationAgent):
             "       Experimentalist (exp_list_exp_data): YES / NO\n"
             "       Experimental Data (exp_data)       : YES / NO\n"
             "       NCN Affiliated (affiliated)        : YES / NO\n\n"
-            "   [6] NANOHUB CONNECTION ASSESSMENT\n"
+            "   [6] NANOHUB / CHIPSHUB CONNECTION ASSESSMENT\n"
             "       Based on ALL available evidence — affiliated flag, ref_type, keywords, abstract, "
             "publication name, author organizations — assess how likely it is that this citation is "
-            "connected to nanoHUB or NCN.\n"
+            "connected to nanoHUB, ChipsHub, or NCN.\n"
+            "       Known NCN-affiliated researchers: Matthew Morrison, Daniel Mejia, Andrew Kahng, Vidya Chhabria.\n"
+            "       If any of these names appear as authors, that supports NCN affiliation.\n"
             "       Write a one-paragraph justification, then give a confidence percentage (0-100%).\n"
-            "       Example: 'nanoHUB connection confidence: 85%'\n\n"
+            "       Example: 'nanoHUB/ChipsHub connection confidence: 85%'\n\n"
             "   [7] RECOMMENDATION\n"
             "       One of: APPROVE / REJECT / NEEDS ATTENTION\n"
-            "       - APPROVE       : citation is clearly relevant to nanoHUB/NCN and all fields complete\n"
-            "       - REJECT        : citation has no apparent nanoHUB/NCN connection\n"
+            "       - APPROVE       : citation is clearly relevant to nanoHUB/ChipsHub/NCN and all fields complete\n"
+            "       - REJECT        : citation has no apparent nanoHUB/ChipsHub/NCN connection\n"
             "       - NEEDS ATTENTION: incomplete fields, duplicate concerns, or ambiguous connection\n"
             "       Follow the recommendation with a single sentence explaining the reason.\n\n"
             "   [8] ASSOCIATIONS\n"
@@ -515,17 +533,21 @@ class HumanReviewAgent(BaseCitationAgent):
         cid = input_data["citation_id"]
 
         if name == "get_citation_details":
-            return self._get_citation_dict(cid)
+            d = self._get_citation_dict(cid)
+            # Truncate large free-text fields to keep context within model limits
+            if isinstance(d.get("abstract"), str) and len(d["abstract"]) > 800:
+                d["abstract"] = d["abstract"][:800] + "...[truncated]"
+            if isinstance(d.get("notes"), str) and len(d["notes"]) > 500:
+                d["notes"] = d["notes"][:500] + "...[truncated]"
+            return d
 
         if name == "get_pipeline_history":
             try:
                 citation = self.cit_client.get(cid)
                 raw_notes = citation.notes or ""
-                compact_notes = _compact_pipeline_notes(raw_notes)
+                compact_notes = _compact_pipeline_notes(raw_notes, max_lines=30, max_chars=2000)
                 return {
                     "notes": compact_notes or "(no notes recorded)",
-                    "notes_full_length": len(raw_notes),
-                    "notes_compacted": bool(raw_notes and compact_notes != raw_notes),
                     "exp_list_exp_data": citation.exp_list_exp_data,
                     "exp_data": citation.exp_data,
                     "affiliated": citation.affiliated,
@@ -543,6 +565,7 @@ class HumanReviewAgent(BaseCitationAgent):
                 return {"error": str(exc)}
 
         if name == "write_review_summary":
+            self._review_summary_written = True
             summary = input_data.get("summary", "")
             try:
                 citation = self.cit_client.get(cid)
@@ -599,7 +622,8 @@ class HumanReviewAgent(BaseCitationAgent):
                         f"{summary}"
                     )
                 self.cit_client.update(citation)
-                return {"ok": True, "summary_length": len(summary)}
+                # Return minimal ack — echoing the full summary back into context causes null responses
+                return {"ok": True, "saved": True}
             except Exception as exc:
                 return {"ok": False, "error": str(exc)}
 
@@ -878,6 +902,107 @@ class HumanReviewAgent(BaseCitationAgent):
         )
         self.cit_client.update(citation)
         return {"ok": True, "source": source, "date_publish": selected}
+
+    def _run_agentic_loop(self, user_message: str) -> str:
+        """Override to stop immediately after write_review_summary succeeds."""
+        self._review_summary_written = False
+        if self._backend == "anthropic":
+            return self._run_anthropic_loop(user_message)
+        return self._run_openai_loop_status5(user_message)
+
+    def _run_openai_loop_status5(self, user_message: str) -> str:
+        """OpenAI loop that exits as soon as write_review_summary is called."""
+        import json as _json
+        messages: List[Dict] = [
+            {"role": "system", "content": self._system_prompt},
+            {"role": "user", "content": user_message},
+        ]
+        from .base_agent import _to_openai_tools
+        tools = _to_openai_tools(self._tool_definitions())
+
+        for _ in range(self.MAX_ITERATIONS):
+            response = None
+            for attempt in range(3):
+                try:
+                    response = self._llm_client.chat.completions.create(
+                        model=self._openai_model,
+                        messages=messages,
+                        tools=tools,
+                        tool_choice="auto",
+                    )
+                    if response is not None and getattr(response, "choices", None):
+                        break
+                    response = None
+                    print(f"    [openai] null response, retrying (attempt {attempt + 1}/3)...")
+                except Exception as exc:
+                    print(f"    [openai] request error: {exc}, retrying (attempt {attempt + 1}/3)...")
+
+            if response is None:
+                if self._review_summary_written:
+                    return "Review summary written."
+                print("    [openai] retrying with compacted context...")
+                compacted = self._compact_messages_for_retry(messages)
+                try:
+                    response = self._llm_client.chat.completions.create(
+                        model=self._openai_model,
+                        messages=compacted,
+                        tools=tools,
+                        tool_choice="auto",
+                    )
+                    if response is not None and getattr(response, "choices", None):
+                        messages = compacted
+                except Exception as exc:
+                    print(f"    [openai] compact-retry error: {exc}")
+                    response = None
+            if response is None:
+                return "Error: LLM returned no response after retries (including compact-retry)."
+
+            choice = response.choices[0]
+            msg = choice.message
+
+            assistant_entry: Dict = {"role": "assistant", "content": msg.content or ""}
+            if msg.tool_calls:
+                assistant_entry["tool_calls"] = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                    }
+                    for tc in msg.tool_calls
+                ]
+            messages.append(assistant_entry)
+
+            if choice.finish_reason == "stop" or not msg.tool_calls:
+                return msg.content or ""
+
+            if choice.finish_reason == "tool_calls":
+                for tc in msg.tool_calls:
+                    name = tc.function.name
+                    try:
+                        input_data = _json.loads(tc.function.arguments)
+                    except _json.JSONDecodeError:
+                        input_data = {}
+
+                    print(f"    → {name}({_json.dumps(input_data)[:120]})")
+                    try:
+                        outcome = self._execute_tool(name, input_data)
+                    except KeyError as exc:
+                        outcome = {"error": f"Missing required parameter: {exc}"}
+                    except Exception as exc:
+                        outcome = {"error": str(exc)}
+                    payload = self._serialize_tool_outcome(outcome)
+                    print(f"    ← {payload[:120]}")
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": payload,
+                    })
+
+                    # Stop immediately after the summary is written — no follow-up call needed
+                    if name == "write_review_summary" and self._review_summary_written:
+                        return "Review summary written."
+
+        return "Max iterations reached."
 
     def run(self, citation_id: int):
         from .base_agent import AgentResult

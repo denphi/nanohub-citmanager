@@ -254,6 +254,9 @@ class ReviewAgent(BaseCitationAgent):
                 r"\bnanohub\.org\b",
                 r"\bncn\b",
                 r"\bnetwork for computational nanotechnology\b",
+                r"\bchipshub\b",
+                r"\bchips[-\s]?hub\b",
+                r"\bchipshub\.org\b",
             ]
             matches = []
             for p in patterns:
